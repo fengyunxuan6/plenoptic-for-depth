@@ -1,7 +1,6 @@
-
 /********************************************************************
 file base:      AdaptMIPMFrame.cpp
-author:         OpenAI + LZD
+author:         LZD
 created:        2026/04/12
 purpose:        整帧GPU版微图像视差匹配（跨视图proposal）
 *********************************************************************/
@@ -130,11 +129,11 @@ namespace LFMVS
         params.patch_size = 5;
         params.patch_Bound_size = 5;
         params.propagation_Graph_size = 5;
-        params.num_images = m_max_neighbors + 1; // 仅用于 top_k 等逻辑，不再表示整帧 view 数
+        params.num_images = m_max_neighbors + 1;
         params.top_k = 5;
-        params.depth_min = 5.0f;
+        params.depth_min = 0.0f;
         params.depth_max = m_ParamsCUDA.baseline * 0.5f;
-        params.disparity_min = 5.0f;
+        params.disparity_min = 0.0f;
         params.disparity_max = m_ParamsCUDA.baseline * 0.5f;
         params.Base = m_ParamsCUDA.baseline;
         params.MLA_Mask_Width_Cuda = m_ParamsCUDA.mi_width_for_match;
@@ -154,18 +153,18 @@ namespace LFMVS
         {
             MLA_Problem& problem = itrP->second;
             QuadTreeTileKeyPtr ptrKey = itrP->first;
-            if (problem.m_bGarbage || problem.m_bNeedMatch == false)
+            if (problem.m_bGarbage || !problem.m_bNeedMatch)
                 continue;
 
             QuadTreeTileInfoMap::iterator itrInfo = MLA_info_map.find(ptrKey);
             if (itrInfo == MLA_info_map.end())
                 continue;
 
-            int vid = (int)m_view_keys.size();
+            const int vid = (int)m_view_keys.size();
             if (vid >= MAX_IMAGES)
             {
                 LOG_ERROR("AdaptMIPMFrame: valid views exceed MAX_IMAGES=", MAX_IMAGES);
-                break;
+                return false;
             }
 
             m_view_keys.push_back(ptrKey);
@@ -186,6 +185,7 @@ namespace LFMVS
             LOG_ERROR("AdaptMIPMFrame: no valid micro-images for current frame.");
             return false;
         }
+        LOG_INFO("AdaptMIPMFrame: valid micro-images loaded = ", m_num_views, ", MAX_IMAGES = ", MAX_IMAGES);
 
         centerPointS_MI = new float2[m_num_views];
         tileKeyS_MI = new int2[m_num_views];
@@ -326,12 +326,12 @@ namespace LFMVS
 
     bool AdaptMIPMFrame::Initialize(QuadTreeTileInfoMap& MLA_info_map, QuadTreeProblemMap& problem_map)
     {
-        BuildViewIndexMap(MLA_info_map, problem_map);
+        if (!BuildViewIndexMap(MLA_info_map, problem_map))
+            return false;
         InitGPUParamsFromCPUParams();
         return InitializeGPU();
     }
 
-    // kernels are defined in AdaptMIPMFrame.cu
     void RunPatchMatchCUDAForFrame_Impl(cudaTextureObjects* texture_objects_cuda,
         float2* centers_cuda, int2* tilekeys_cuda, int* neighbor_ids_cuda, int* neighbor_counts_cuda,
         float4* plane_prev_cuda, float4* plane_next_cuda, float* cost_prev_cuda, float* cost_next_cuda,
