@@ -220,6 +220,7 @@ cuda_add_executable(
         CommonMVS/Util.h
         CommonMVS/Util.cpp
         CommonMVS/Util.inl
+        CheckModule/MIDisparityFilter.cpp
 )
 
 # 编译标志
