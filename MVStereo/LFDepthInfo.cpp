@@ -10,6 +10,53 @@ purpose:
 
 namespace LFMVS
 {
+    namespace
+    {
+        static inline float SafeDenomCPU(float v)
+        {
+            if (fabsf(v) < 1e-6f)
+                return (v >= 0.0f) ? 1e-6f : -1e-6f;
+            return v;
+        }
+
+        // 与 CUDA 版 DisparityPlane(p, plane_hypothesis) 保持一致
+        static inline float3 DisparityPlaneCPU(const int2 p, const float4& plane_hypothesis)
+        {
+            const float nz = SafeDenomCPU(plane_hypothesis.z);
+
+            float3 plane;
+            plane.x = -plane_hypothesis.x / nz; // alpha
+            plane.y = -plane_hypothesis.y / nz; // beta
+            plane.z = (plane_hypothesis.x * p.x +
+                       plane_hypothesis.y * p.y +
+                       plane_hypothesis.z * plane_hypothesis.w) / nz; // gamma
+            return plane;
+        }
+
+        // 把 disparity plane: d(x,y)=alpha*x+beta*y+gamma
+        // 重新编码回当前工程使用的 plane_hypothesis = normal + anchor disparity
+        static inline float4 EncodePlaneHypothesisFromDispPlaneCPU(const int2 anchor,
+                                                                   const float alpha,
+                                                                   const float beta,
+                                                                   const float gamma)
+        {
+            float nx = -alpha;
+            float ny = -beta;
+            float nz =  1.0f;
+
+            float norm = sqrtf(nx * nx + ny * ny + nz * nz);
+            if (norm < 1e-6f)
+                norm = 1e-6f;
+
+            nx /= norm;
+            ny /= norm;
+            nz /= norm;
+
+            const float d_anchor = alpha * anchor.x + beta * anchor.y + gamma;
+            return make_float4(nx, ny, nz, d_anchor);
+        }
+    }
+
     void MLA_Problem::SetM_NeigKeyPtrVec(QuadTreeTileKeyPtrVec& NeigKeyPtrVec)
     {
         m_NeigKeyPtrVec = NeigKeyPtrVec;
@@ -579,96 +626,111 @@ namespace LFMVS
         return false;
     }
 
-    void DisparityAndNormal::CollectPropagationGraphLackedPixels(const int2 center, const int mi_width,
-        const int mi_height, MLA_Problem& problem, QuadTreeTileInfoMap& mla_info_map,
-std::map<QuadTreeTileKeyPtr, std::shared_ptr<DisparityAndNormal>, QuadTreeTileKeyMapCmpLess>& disNormals_map,
-Proxy_DisPlane* proxy_dis_plane)
+    void DisparityAndNormal::CollectPropagationGraphLackedPixels(
+        const int2 center,
+        const int mi_width,
+        const int mi_height,
+        MLA_Problem& problem,
+        QuadTreeTileInfoMap& mla_info_map,
+        std::map<QuadTreeTileKeyPtr, std::shared_ptr<DisparityAndNormal>, QuadTreeTileKeyMapCmpLess>& disNormals_map,
+        Proxy_DisPlane* proxy_dis_plane)
     {
-        if (neighbor_PGR_info->x <= 0) // todo: 序号为包含自身图像的邻域集合中的索引（自身为0）
+        const int p_ref = center.y * mi_width + center.x;
+        const int3 pgr_info = neighbor_PGR_info[p_ref];
+
+        // 必须取当前像素自己的 PGR 信息，原来直接用 neighbor_PGR_info->x/y/z 是错的
+        if (pgr_info.x <= 0)
+            return;
+
+        // 当前逻辑仍然只在边界像素上做 repair
+        if (!(center.x < 3 || center.x >= (mi_width - 3) ||
+              center.y < 3 || center.y >= (mi_height - 3)))
         {
             return;
         }
 
-        // 邻近八个像素
-        int2 left_near = make_int2(center.x-1, center.y);
-        int2 left_far = make_int2(center.x-3, center.y);
-        int2 right_near = make_int2(center.x+1, center.y);
-        int2 right_far = make_int2(center.x+3, center.y);
-        int2 up_near = make_int2(center.x, center.y-1);
-        int2 up_far = make_int2(center.x, center.y-3);
-        int2 down_near = make_int2(center.x, center.y+1);
-        int2 down_far = make_int2(center.x, center.y+3);
-        const int2 positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
-
-        //参考图像信息
-        int p_ref = center.y * mi_width + center.x;
-        //float4 p_ref_plane_hypothesis = ph_cuda[p_ref]; //参考图像的同名点视差假设
         MLA_InfoPtr mla_ref_info = mla_info_map[m_ptrKey];
         if (mla_ref_info == NULL)
+            return;
+
+        const cv::Point2f mla_ref_cv_center = mla_ref_info->GetCenter();
+
+        // 当前像素对应的“借用邻域微图像”编号（去掉自身占位）
+        const int neig_mi_id = pgr_info.x - 1;
+        if (neig_mi_id < 0 || neig_mi_id >= (int)problem.m_NeighsSortVecForMatch.size())
+            return;
+
+        QuadTreeTileKeyPtr ptrNeigKey = problem.m_NeighsSortVecForMatch[neig_mi_id];
+        if (!ptrNeigKey)
+            return;
+
+        QuadTreeDisNormalMap::iterator itr_DN = disNormals_map.find(ptrNeigKey);
+        if (itr_DN == disNormals_map.end())
+        {
+            std::cout << "Neighbor DN not found: " << ptrNeigKey->StrRemoveLOD().c_str() << std::endl;
+            return;
+        }
+        DisparityAndNormalPtr ptrDN_neig = itr_DN->second;
+
+        MLA_InfoPtr mla_src_info = mla_info_map[ptrNeigKey];
+        if (mla_src_info == NULL)
+            return;
+
+        const cv::Point2f mla_src_cv_center = mla_src_info->GetCenter();
+        const float2 delta_u_v = make_float2(
+            mla_ref_cv_center.x - mla_src_cv_center.x,
+            mla_ref_cv_center.y - mla_src_cv_center.y);
+
+        // 当前像素在邻域微图像中的对应点（由第一阶段记录）
+        const int2 neig_correspond_coord = make_int2(pgr_info.y, pgr_info.z);
+        if (neig_correspond_coord.x < 0 || neig_correspond_coord.x >= mi_width ||
+            neig_correspond_coord.y < 0 || neig_correspond_coord.y >= mi_height)
         {
             return;
         }
-        cv::Point2f mla_ref_cv_center = mla_ref_info->GetCenter();
-        //floa mla_ref_center = make_int2(mla_ref_cv_center.x, mla_ref_cv_center.y);//参考图像的像主点坐标
 
-        if(center.x<3 || center.x>=(mi_width-3) || center.y<3 || center.y>=(mi_height-3))
+        const int p_neig = neig_correspond_coord.y * mi_width + neig_correspond_coord.x;
+        const float4 plane_hypothesis_neig = ptrDN_neig->ph_cuda[p_neig];
+
+        // 关键修正：
+        // 不能直接把 plane_hypothesis_neig.xyz 当 alpha/beta/gamma
+        // 必须先在邻域锚点 q 上转成 disparity plane
+        const float3 disp_plane_neig = DisparityPlaneCPU(neig_correspond_coord, plane_hypothesis_neig);
+        const float alpha = disp_plane_neig.x;
+        const float beta  = disp_plane_neig.y;
+        const float gamma = disp_plane_neig.z;
+
+        float denom = 1.0f + alpha * delta_u_v.x + beta * delta_u_v.y;
+        denom = SafeDenomCPU(denom);
+
+        // 按你原来的跨视图平面变换公式
+        const float aR = alpha / denom;
+        const float bR = beta  / denom;
+        const float cR = gamma / denom;
+
+        // 邻近八个像素
+        const int2 positions[8] =
         {
-            //邻域微图像的微透镜参数
-            MLA_InfoPtr mla_src_info = mla_info_map[problem.m_ptrKey];//??????,邻域微图像像主点坐标
-            if (mla_src_info == NULL)
+            make_int2(center.x,   center.y - 1), // up_near
+            make_int2(center.x,   center.y - 3), // up_far
+            make_int2(center.x,   center.y + 1), // down_near
+            make_int2(center.x,   center.y + 3), // down_far
+            make_int2(center.x - 1, center.y),   // left_near
+            make_int2(center.x - 3, center.y),   // left_far
+            make_int2(center.x + 1, center.y),   // right_near
+            make_int2(center.x + 3, center.y)    // right_far
+        };
+
+        for (int i = 0; i < 8; ++i)
+        {
+            const int2 p = positions[i];
+
+            // 只给越界位置补 proxy plane
+            if (p.x < 0 || p.x >= mi_width || p.y < 0 || p.y >= mi_height)
             {
-                return;
-            }
-            cv::Point2f mla_src_cv_center = mla_src_info->GetCenter();
-            //int2 mla_src_center = make_int2(mla_src_cv_center.x, mla_src_cv_center.y);//参考图像的像主点坐标
-            //视差偏移量
-            float2 delta_u_v = make_float2(mla_ref_cv_center.x-mla_src_cv_center.x,mla_ref_cv_center.y-mla_src_cv_center.y);
-
-            for (int i = 0; i < 8; i++)
-            {
-                int2 p = positions[i];
-                // 判断是否需要借用
-                if (p.x < 0 || p.x >= mi_width || p.y < 0 || p.y >= mi_height)
-                {
-                    int neig_mi_id = neighbor_PGR_info->x - 1; // TOOD：应减掉自身占的位
-
-                    // 邻域微图像的匹配结果
-                    QuadTreeTileKeyPtr ptrNeigKey = problem.m_NeighsSortVecForMatch[neig_mi_id];
-                    if (!ptrNeigKey)
-                    {
-                        std::cout<<"ptrNeigKey is empty, ref is: " <<m_ptrKey->StrRemoveLOD().c_str()<<std::endl;
-                        continue;
-                    }
-                    QuadTreeDisNormalMap::iterator itr_DN = disNormals_map.find(ptrNeigKey);
-                    if (itr_DN == disNormals_map.end())
-                    {
-                        std::cout << "Current Image not found: " << ptrNeigKey->StrRemoveLOD().c_str() << std::endl;
-                        continue;
-                    }
-                    DisparityAndNormalPtr ptrDN_neig = itr_DN->second;
-                    // 小窗口中找最小的cost的像素
-                    float4* plane_hypothesis_neig = ptrDN_neig->ph_cuda; // 视差平面
-                    float4* disp_baseline_neig = ptrDN_neig->disp_v_cuda; // 第一个参数为标准视差
-
-                    // TODO：视差平面转换
-                    int2 neig_correspond_coord = make_int2(neighbor_PGR_info->y, neighbor_PGR_info->z);  //邻域图像中的同名点
-                    int p_neig = neig_correspond_coord.y * mi_width + neig_correspond_coord.x;
-                    float4 p_neig_plane_hypothesis= plane_hypothesis_neig[p_neig];//邻域图像中的同名点对应的平面参数
-
-                    float alpha = p_neig_plane_hypothesis.x;
-                    float beta = p_neig_plane_hypothesis.y;
-                    float gamma = p_neig_plane_hypothesis.z;
-                    float denom = 1.0f+alpha*delta_u_v.x+beta*delta_u_v.y+1e-6f;
-                    float aR = alpha/(denom);
-                    float bR = beta/(denom);
-                    float cR = gamma/(denom);
-                    //计算8个像素对应的视差值
-                    float dR = aR*p.x+bR*p.y+cR;
-                    float4 p_neig_to_ref_plane_hypothesis = make_float4(aR,bR,cR,dR);
-                    proxy_dis_plane->plane[i]=p_neig_to_ref_plane_hypothesis;
-                }
+                // 再编码回 plane_hypothesis 形式，而不是直接 make_float4(aR,bR,cR,dR)
+                proxy_dis_plane->plane[i] = EncodePlaneHypothesisFromDispPlaneCPU(p, aR, bR, cR);
             }
         }
     }
 }
-
