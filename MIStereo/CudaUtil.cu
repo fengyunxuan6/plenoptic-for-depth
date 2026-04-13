@@ -1043,3 +1043,5 @@ namespace LFMVS
             p, params, iter, width, height);
     }
 }
+
+#include "AdaptMIPMFrame.cu"
