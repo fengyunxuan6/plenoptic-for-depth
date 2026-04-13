@@ -5,11 +5,14 @@ created:        2025/06/04
 purpose:        微图像的视差计算
 *********************************************************************/
 #include "MIStereoMatch.h"
+#include "AdaptMIPMFrame.h"
+#include "AdaptMIPMFrame.cpp"
 
 #include "Util/Logger.h"
 #include "boost/filesystem.hpp"
 
 #include "CheckModule/MICycleCheck.h"
+#include "CheckModule/MIDisparityFilter.h"
 
 namespace LFMVS
 {
@@ -465,16 +468,11 @@ namespace LFMVS
 
     void MIStereoMatch::StereoMatchingForMIA_SoftProxyRepair(QuadTreeProblemMapMap::iterator& itrFrame)
     {
-        LOG_ERROR("MISM: StereoMatchingForMIA_SoftProxyRepair, Begin");
-        // 微透镜阵列相关参数（硬件）
+        LOG_ERROR("MISM: StereoMatchingForMIA_SoftProxyRepair(FrameCrossView), Begin");
+
         QuadTreeTileInfoMap& MLA_info_map = m_ptrDepthSolver->GetMLAInfoMap();
         LightFieldParams& params = m_ptrDepthSolver->GetLightFieldParams();
 
-        std::string& strRootPath = m_ptrDepthSolver->GetRootPath();
-        int mi_width = params.mi_width_for_match;
-        int mi_height = params.mi_height_for_match;
-
-        // step2: 视觉匹配
         std::string strFrameName = itrFrame->first;
         QuadTreeProblemMap& problems_map = itrFrame->second;
         QuadTreeDisNormalMapMap& disNormalMapMap = m_ptrDepthSolver->GetMLADisNormalMapMap();
@@ -486,109 +484,31 @@ namespace LFMVS
         }
         QuadTreeDisNormalMap& disNormals_map = itrDis->second;
 
-        int garbge = 0;
-        // 当前帧中，逐个微图像遍历进行视差匹配
-        for(QuadTreeProblemMap::iterator itrP = problems_map.begin(); itrP != problems_map.end(); ++itrP)
+        const int top_gpu_device = m_ptrDepthSolver->GetTopGPUDevice();
+        if (top_gpu_device == -1)
         {
-            MLA_Problem& problem = itrP->second;
-            QuadTreeTileKeyPtr ptrKey = itrP->first;
-            if (problem.m_bGarbage /*|| problem.m_bNeedMatch==false*/)
-            {
-                garbge++;
-                continue;
-            }
-
-            // step1: 判断是否有可用于匹配的gpu
-            const int top_gpu_device = m_ptrDepthSolver->GetTopGPUDevice();
-            if (top_gpu_device == -1)
-            {
-                LOG_ERROR("PPLFT: Error! Find GPU device index is: ", top_gpu_device);
-                continue;
-            }
-            cudaError_t err = cudaSetDevice(top_gpu_device);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("PPLFT: Error! cudaSetDevice: ", err);
-                continue;
-            }
-
-            QuadTreeDisNormalMap::iterator itr_DN = disNormals_map.find(ptrKey);
-            if (itr_DN == disNormals_map.end())
-            {
-                LOG_ERROR("Current Image not found: ", ptrKey->StrRemoveLOD().c_str());
-                continue;
-            }
-
-            std::vector<float4> planeVec;
-            std::vector<float> costVec;
-            AdaptMIPM adapt_MIPM(params);
-            adapt_MIPM.SetTileKey(ptrKey->GetTileX(), ptrKey->GetTileY());
-            adapt_MIPM.Initialize(MLA_info_map, problem, problems_map, planeVec, costVec);
-            adapt_MIPM.RunPatchMatchCUDAForMI_SoftProxy_PatchRepair();
-            // 深度估计结果：cuda--->host
-            DisparityAndNormalPtr ptrDN = itr_DN->second;
-            cv::Mat_<float> depths = cv::Mat::zeros(mi_height, mi_width, CV_32FC1);
-#pragma omp parallel for schedule(dynamic)
-            for (int row = 0; row < mi_height; row++)
-            {
-                for (int col = 0; col < mi_width; col++)
-                {
-                    int index = row*mi_width + col;
-                    float4 plane_hypothesis = adapt_MIPM.GetPlaneHypothesis(index);
-                    float cost = adapt_MIPM.GetCost(index);
-                    unsigned int neig_viewBit = adapt_MIPM.GetSelected_viewIndexs(col, row);
-                    float4 disp_baseline = adapt_MIPM.GetDisparityBaseline(index);
-
-                    ptrDN->ph_cuda[index] = plane_hypothesis;
-                    ptrDN->d_cuda[index] = plane_hypothesis.w ; // disp_baseline.w
-                    //std::cout<<"dis: "<<plane_hypothesis.w <<std::endl;
-                    depths(row, col) = plane_hypothesis.w; // disp_baseline.w
-                    // std::cout<<"d_real: "<<disp_baseline.y<<std::endl;
-                    ptrDN->c_cuda[index] = cost;
-                    ptrDN->selected_views[index] = neig_viewBit;
-                }
-            }
-            ptrDN->m_StereoStage = eSS_ACMH_Finished;
-            // 处理写出和测试
-            if (g_Debug_Save >= 1)
-            {
-                TestWriteDisparityImage(strFrameName, ptrKey, adapt_MIPM);
-            }
-            adapt_MIPM.ReleaseMemory();
+            LOG_ERROR("PPLFT: Error! Find GPU device index is: ", top_gpu_device);
+            return;
+        }
+        cudaError_t err = cudaSetDevice(top_gpu_device);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("PPLFT: Error! cudaSetDevice: ", err);
+            return;
         }
 
-        // 2) 全部完成 → 全局闭环验证（CPU，不用任何 AdaptMIPM）
-        if (g_Debug_Static >= 1)
+        AdaptMIPMFrame adapt_frame(params);
+        if (!adapt_frame.Initialize(MLA_info_map, problems_map))
         {
-            MICycleCheckStats stats;
-            std::string str_chenck_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME + strFrameName + LF_MVS_RESULT_DATA_NAME +"CycleCheck";
-            MICycleCheckerCPU checker(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
-
-            MICycleClampConfig ccfg;
-            ccfg.clamp_photo = true; ccfg.photo_u = 3.0;
-            ccfg.clamp_geo = true; ccfg.geo_u_px = 2.0;
-            ccfg.skip_on_geo = true; ccfg.skip_geo_u_px = 8.0;
-            ccfg.skip_on_photo = true; ccfg.skip_photo_u = 8.0;
-            ccfg.gate_geo_px = 0.5;
-            ccfg.gate_photo_u = 0.5;
-            ccfg.gate_min_good_neighbors = 2;
-            // ① 全局检查 + 指标 + 可视化
-            checker.CheckGlobal(strFrameName, MLA_info_map, problems_map, disNormals_map,
-                                stats, 4,false,
-                                str_chenck_save_root, true,
-                                60, 2.0, 2.0,
-                                3.0, ccfg);
-
-            // ② 随机匹配可视化（跨图连线严格复用上一轮随机点）
-            std::string str_chenck_save_root_match = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-            + strFrameName + LF_MVS_RESULT_DATA_NAME +"CycleCheck/Match";
-            checker.VisualizeRandomMatchesGlobal(strFrameName, MLA_info_map, problems_map, disNormals_map,
-                                8, 50, 4, str_chenck_save_root_match,
-                                12345, true);
-
-            // TODO：如果需要，可根据 stats 的阈值触发二次修复或降权
+            LOG_ERROR("AdaptMIPMFrame.Initialize failed");
+            return;
         }
-        LOG_ERROR("MISM: StereoMatchingForMIA_SoftProxyRepair, End, garbge=", garbge);
+
+        adapt_frame.RunPatchMatchCUDAForFrame();
+        adapt_frame.WriteBackResults(disNormals_map);
+        adapt_frame.ReleaseMemory();
+
+        LOG_ERROR("MISM: StereoMatchingForMIA_SoftProxyRepair(FrameCrossView), End");
     }
 
     void MIStereoMatch::StereoMatchingForMIA_SoftProxyPGRRepair(QuadTreeProblemMapMap::iterator& itrFrame)
@@ -852,6 +772,34 @@ namespace LFMVS
             }
             adapt_PFPGR.ReleaseMemory(); // TODO: LZD 释放内存or显存？
         }
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // ② 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
+        MIDisparityFilterConfig fcfg;
+        fcfg.max_triplet = 4;
+        fcfg.min_valid_disp = 0.0f;
+        fcfg.use_selected_views_only = true;
+        fcfg.clear_selected_views_when_invalid = true;
+        fcfg.enable_cost_filter = true;
+        fcfg.max_cost = 1.8f;
+        fcfg.enable_cycle_geo_filter = true;
+        fcfg.max_geo_err_px = 0.5;
+        fcfg.enable_cycle_photo_filter = true;
+        fcfg.max_photo_err_u = 0.5;
+        fcfg.min_good_neighbors = 2;
+        fcfg.enable_spike_filter = true;
+        fcfg.spike_abs_diff = 1.0f;
+        fcfg.spike_min_neighbors = 3;
+        fcfg.dump_debug_mask = (g_Debug_Static >= 1);
+
+        MIDisparityFilterStats filter_stats;
+        std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
+                    + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
+        MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
+        filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
+                            disNormals_map, fcfg, filter_stats,
+                               str_filter_save_root);
+        //////////////////////////////////////////////
         LOG_ERROR("MISM: StereoMatchingForMIA_SoftProxyPGRRepair, End, garbge=", garbge);
     }
 }
