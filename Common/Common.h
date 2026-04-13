@@ -28,7 +28,8 @@ namespace LFMVS
     using Vec3d = Eigen::Vector3d;
 
     /////////////////////////////////////////////////////////////////////////
-    #define MAX_IMAGES 256
+    // #define MAX_IMAGES 256
+    #define MAX_IMAGES 8192
     #define LF_LOGGER_FOLDER_NAME ("/logs")
     #define LF_RAW_DATASET_NAME ("/raw_dataset/")
     #define LF_CALIB_FOLDER_NAME ("/calibration/")
