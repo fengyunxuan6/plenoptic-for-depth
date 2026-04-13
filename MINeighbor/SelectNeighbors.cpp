@@ -821,9 +821,9 @@ neareastKeys, candidateNeighKeysFast, fDelt) )
              float a = 1.00; // 0.50 todo:lzd 0902
              float b = 0.00; // 0.30
              float c = 0.00; // 0.20
-             // float a = 1.00; // 0.50 todo:lzd 0902
-             // float b = 0.00; // 0.30
-             // float c = 0.00; // 0.20
+             // float a = 0.50; // 0.50 todo:lzd 0902
+             // float b = 0.30; // 0.30
+             // float c = 0.20; // 0.20
 
              float score = a*(1.0-fBaselineTerm) + b*fPhotographicTerm + c*fBlurScaleTerm;
              // float score = a*(fBaselineTerm) + b*fPhotographicTerm + c*fBlurScaleTerm;
