@@ -14,7 +14,7 @@ namespace LFMVS
     AdaptMIPMFrame::AdaptMIPMFrame(LightFieldParams& paramsIn)
         : m_ParamsCUDA(paramsIn)
         , m_num_views(0)
-        , m_max_neighbors(8)
+        , m_max_neighbors(16)
         , m_pixels_per_view(0)
         , m_bReleased(false)
         , centerPointS_MI(nullptr)
@@ -185,7 +185,9 @@ namespace LFMVS
             LOG_ERROR("AdaptMIPMFrame: no valid micro-images for current frame.");
             return false;
         }
-        LOG_INFO("AdaptMIPMFrame: valid micro-images loaded = ", m_num_views, ", MAX_IMAGES = ", MAX_IMAGES);
+        LOG_INFO("AdaptMIPMFrame: valid micro-images loaded = ", m_num_views,
+                 ", MAX_IMAGES = ", MAX_IMAGES,
+                 ", m_max_neighbors = ", m_max_neighbors);
 
         centerPointS_MI = new float2[m_num_views];
         tileKeyS_MI = new int2[m_num_views];
