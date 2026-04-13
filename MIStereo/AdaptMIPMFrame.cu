@@ -1,7 +1,6 @@
-
 /********************************************************************
 file base:      AdaptMIPMFrame.cu
-author:         OpenAI + LZD
+author:         LZD
 created:        2026/04/12
 purpose:        整帧GPU版微图像视差匹配（跨视图proposal）
 *********************************************************************/
@@ -27,19 +26,30 @@ namespace LFMVS
         return fminf(2.0f, fmaxf(0.0f, v));
     }
 
-    static __device__ __forceinline__ void CopyIfOtherPhase(
-        const int idx,
-        const int x, const int y, const int phase,
-        const float4* plane_prev, const float* cost_prev, const float4* disp_prev, const unsigned int* sel_prev,
-        float4* plane_next, float* cost_next, float4* disp_next, unsigned int* sel_next)
+    static __device__ __forceinline__ float SafeDenomDevice(float v)
     {
-        if (((x + y) & 1) != phase)
-        {
-            plane_next[idx] = plane_prev[idx];
-            cost_next[idx] = cost_prev[idx];
-            disp_next[idx] = disp_prev[idx];
-            sel_next[idx] = sel_prev[idx];
-        }
+        if (fabsf(v) < 1e-6f)
+            return (v >= 0.0f) ? 1e-6f : -1e-6f;
+        return v;
+    }
+
+    static __device__ __forceinline__ float4 EncodePlaneHypothesisFromDispPlaneDevice(
+        const int2 anchor,
+        const float alpha,
+        const float beta,
+        const float gamma)
+    {
+        float nx = -alpha;
+        float ny = -beta;
+        float nz =  1.0f;
+
+        const float inv_norm = rsqrtf(nx * nx + ny * ny + nz * nz + 1e-12f);
+        nx *= inv_norm;
+        ny *= inv_norm;
+        nz *= inv_norm;
+
+        const float d_anchor = alpha * anchor.x + beta * anchor.y + gamma;
+        return make_float4(nx, ny, nz, d_anchor);
     }
 
     static __device__ float ComputeBilateralNCC_Frame(
@@ -152,7 +162,11 @@ namespace LFMVS
         float4 disp_local[32];
         float2 blur_local[32];
         const int neigh_count = neighbor_counts[ref_vid];
-        for (int i = 0; i < 32; ++i) { costs_local[i] = 2.0f; disp_local[i] = make_float4(0,0,0,0); blur_local[i] = make_float2(0,0); }
+        for (int i = 0; i < 32; ++i) {
+            costs_local[i] = 2.0f;
+            disp_local[i] = make_float4(0,0,0,0);
+            blur_local[i] = make_float2(0,0);
+        }
 
         const float2 c0 = centers[ref_vid];
         const int2 tk0 = tilekeys[ref_vid];
@@ -169,7 +183,6 @@ namespace LFMVS
                                                 images[nvid], blur_images[nvid], centers[nvid], tilekeys[nvid],
                                                 p, plane_hypothesis, params, blur_v, disp_b);
 
-            // 模糊差异惩罚
             float blur_weight = expf(-0.007368f * (blur_v.x - blur_v.y) * (blur_v.x - blur_v.y));
             c = clamp_cost(c + 2.0f * (1.0f - blur_weight));
 
@@ -186,7 +199,6 @@ namespace LFMVS
             return 2.0f;
         }
 
-        // simple top-k average
         const int top_k = min(valid, params.top_k);
         for (int i = 0; i < neigh_count && i < max_neighbors; ++i)
         {
@@ -202,7 +214,6 @@ namespace LFMVS
         }
 
         float sum = 0.0f;
-        float best_cost = costs_local[0];
         float4 best_disp = disp_local[0];
         for (int i = 0; i < top_k; ++i)
             sum += costs_local[i];
@@ -248,29 +259,41 @@ namespace LFMVS
     {
         float2 qf;
         float4 tmp_disp;
-        DisparityGeometricMapOperate_Hex(centers[ref_vid], centers[neigh_vid], p, current_plane, p, params,
-                                         qf, tmp_disp, tilekeys[ref_vid], tilekeys[neigh_vid]);
+        DisparityGeometricMapOperate_Hex(
+            centers[ref_vid], centers[neigh_vid],
+            p, current_plane, p, params,
+            qf, tmp_disp,
+            tilekeys[ref_vid], tilekeys[neigh_vid]);
 
         const int qx = (int)floorf(qf.x + 0.5f);
         const int qy = (int)floorf(qf.y + 0.5f);
-        if (qx < 0 || qx >= params.MLA_Mask_Width_Cuda || qy < 0 || qy >= params.MLA_Mask_Height_Cuda)
+        if (qx < 0 || qx >= params.MLA_Mask_Width_Cuda ||
+            qy < 0 || qy >= params.MLA_Mask_Height_Cuda)
+        {
             return false;
+        }
 
-        const int q_local = qy * params.MLA_Mask_Width_Cuda + qx;
-        const float4 plane_neigh = plane_prev[FrameIndex1D(neigh_vid, q_local, pixels_per_view)];
+        const int2 q = make_int2(qx, qy);
+        const int q_local = q.y * params.MLA_Mask_Width_Cuda + q.x;
+        const float4 plane_neigh_hyp = plane_prev[FrameIndex1D(neigh_vid, q_local, pixels_per_view)];
 
-        const float alpha = plane_neigh.x;
-        const float beta  = plane_neigh.y;
-        const float gamma = plane_neigh.z;
+        // 核心修正：先在邻域锚点 q 上把 plane_hypothesis 转为 disparity plane
+        const float3 disp_plane_neigh = DisparityPlane(q, plane_neigh_hyp);
+        const float alpha = disp_plane_neigh.x;
+        const float beta  = disp_plane_neigh.y;
+        const float gamma = disp_plane_neigh.z;
+
         const float du = centers[ref_vid].x - centers[neigh_vid].x;
         const float dv = centers[ref_vid].y - centers[neigh_vid].y;
-        const float denom = 1.0f + alpha * du + beta * dv + 1e-6f;
+
+        float denom = 1.0f + alpha * du + beta * dv;
+        denom = SafeDenomDevice(denom);
 
         const float aR = alpha / denom;
         const float bR = beta  / denom;
         const float cR = gamma / denom;
-        const float dR = aR * p.x + bR * p.y + cR;
-        out_plane = make_float4(aR, bR, cR, dR);
+
+        out_plane = EncodePlaneHypothesisFromDispPlaneDevice(p, aR, bR, cR);
         return true;
     }
 
@@ -363,7 +386,6 @@ namespace LFMVS
         float4 best_disp = disp_prev[idx];
         unsigned int best_sel = selected_prev[idx];
 
-        // re-evaluate current plane against current support snapshot
         {
             unsigned int sel = 0;
             float4 disp_b = make_float4(0,0,0,0);
@@ -375,7 +397,6 @@ namespace LFMVS
             best_sel = sel;
         }
 
-        // local same-view proposals: 8 directions
         const int local_x[8] = {x, x, x, x, x - 1, x - 3, x + 1, x + 3};
         const int local_y[8] = {y - 1, y - 3, y + 1, y + 3, y, y, y, y};
         for (int k = 0; k < 8; ++k)
@@ -402,7 +423,6 @@ namespace LFMVS
             }
         }
 
-        // cross-view proposals from each support view
         const int neigh_count = neighbor_counts[vid];
         for (int k = 0; k < neigh_count && k < max_neighbors; ++k)
         {
@@ -428,7 +448,6 @@ namespace LFMVS
             }
         }
 
-        // one random refinement proposal
         {
             float4 rand_plane = GenerateRandomPlaneHypothesis_MIPM(p, &rand_states[idx], params.depth_min, params.depth_max);
             unsigned int sel = 0;
