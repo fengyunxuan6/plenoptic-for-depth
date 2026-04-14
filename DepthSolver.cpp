@@ -2789,7 +2789,8 @@ namespace LFMVS {
             MIStereoMatch miStereoImp(this);
             //miStereoImp.StereoMatchingForMIA(itrFrame);
             //miStereoImp.StereoMatchingForMIA_SoftProxyRepair(itrFrame);
-            miStereoImp.StereoMatchingForMIA_FrameCrossViews(itrFrame);
+            // miStereoImp.StereoMatchingForMIA_FrameCrossViews(itrFrame);
+            miStereoImp.StereoMatchingForMIA_FrameCrossViews_ACMM(itrFrame);
             //miStereoImp.StereoMatchingForMIA_SoftProxyPGRRepair(itrFrame);
             WriteDisMapForMIA(strFrameName, problems_map);
             PrintMemoryInfo("Stereo Finish");
