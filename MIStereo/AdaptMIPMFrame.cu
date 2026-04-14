@@ -52,6 +52,24 @@ namespace LFMVS
         return make_float4(nx, ny, nz, d_anchor);
     }
 
+    static __device__ __forceinline__ float EvalDisparityAtPixel_Frame(
+        const float3& d_plane,
+        const int2& p)
+    {
+        return d_plane.x * p.x + d_plane.y * p.y + d_plane.z;
+    }
+
+    static __device__ __forceinline__ float2 MapRefToSrcFast_Hex_Frame(
+        const int2& ref_pt,
+        const float disparity,
+        const float step_x,
+        const float step_y)
+    {
+        return make_float2(
+            ref_pt.x + step_x * disparity,
+            ref_pt.y + step_y * disparity);
+    }
+
     static __device__ float ComputeBilateralNCC_Frame(
         const cudaTextureObject_t ref_image,
         const cudaTextureObject_t ref_blur_image,
@@ -69,11 +87,25 @@ namespace LFMVS
     {
         const float cost_max = 2.0f;
         const int radius = params.patch_size / 2;
-        float2 pt;
+        const float pixel_max = 255.0f;
 
-        DisparityGeometricMapOperate_Hex(c0, c1, p, plane_hypothesis, p, params, pt, disparity_baseline, tk0, tk1);
-        if (pt.x >= params.MLA_Mask_Width_Cuda || pt.x < 0.0f || pt.y >= params.MLA_Mask_Height_Cuda || pt.y < 0.0f)
+        blur_value = make_float2(0.0f, 0.0f);
+
+        float2 pt_anchor;
+        DisparityGeometricMapOperate_Hex(
+            c0, c1, p, plane_hypothesis, p, params,
+            pt_anchor, disparity_baseline, tk0, tk1);
+
+        if (pt_anchor.x >= params.MLA_Mask_Width_Cuda || pt_anchor.x < 0.0f ||
+            pt_anchor.y >= params.MLA_Mask_Height_Cuda || pt_anchor.y < 0.0f)
+        {
             return cost_max;
+        }
+
+        const float3 d_plane = DisparityPlane(p, plane_hypothesis);
+        const float inv_base = 1.0f / fmaxf(params.Base, 1e-6f);
+        const float step_x = (c0.x - c1.x) * inv_base;
+        const float step_y = (c0.y - c1.y) * inv_base;
 
         float sum_ref = 0.0f;
         float sum_ref_ref = 0.0f;
@@ -83,7 +115,6 @@ namespace LFMVS
         float bilateral_weight_sum = 0.0f;
 
         const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
-        const float pixel_max = 255.0f;
 
         for (int i = -radius; i <= radius; i += params.radius_increment)
         {
@@ -92,14 +123,18 @@ namespace LFMVS
                 const int2 ref_pt = make_int2(p.x + i, p.y + j);
                 if (ref_pt.x < 0 || ref_pt.x >= params.MLA_Mask_Width_Cuda ||
                     ref_pt.y < 0 || ref_pt.y >= params.MLA_Mask_Height_Cuda)
+                {
                     continue;
+                }
 
-                float2 src_pt;
-                float4 tmp_db;
-                DisparityGeometricMapOperate_Hex(c0, c1, p, plane_hypothesis, ref_pt, params, src_pt, tmp_db, tk0, tk1);
+                const float d = EvalDisparityAtPixel_Frame(d_plane, ref_pt);
+                const float2 src_pt = MapRefToSrcFast_Hex_Frame(ref_pt, d, step_x, step_y);
+
                 if (src_pt.x < 0.0f || src_pt.x >= params.MLA_Mask_Width_Cuda ||
                     src_pt.y < 0.0f || src_pt.y >= params.MLA_Mask_Height_Cuda)
+                {
                     continue;
+                }
 
                 const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
                 const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
@@ -109,7 +144,9 @@ namespace LFMVS
                 blur_value.x += ref_blur_v;
                 blur_value.y += src_blur_v;
 
-                const float weight = ComputeBilateralWeight(i, j, ref_pix, ref_center_pix, params.sigma_spatial, params.sigma_color);
+                const float weight = ComputeBilateralWeight(
+                    i, j, ref_pix, ref_center_pix,
+                    params.sigma_spatial, params.sigma_color);
 
                 sum_ref += weight * ref_pix;
                 sum_ref_ref += weight * ref_pix * ref_pix;
@@ -532,7 +569,6 @@ namespace LFMVS
             return;
         }
 
-        // same-view candidate generation (closer to original per-MI)
         float cost_array[8][32];
         float2 blur_array[8][32];
         float4 disp_array[8][32];
@@ -758,7 +794,6 @@ namespace LFMVS
             for (int j = 0; j < 32; ++j) { cost_array[7][j] = cost_array[6][j]; blur_array[7][j] = blur_array[6][j]; disp_array[7][j] = disp_array[6][j]; }
         }
 
-        // joint view selection based on same-view hypotheses only
         float view_selection_priors[32] = {0.0f};
         const int direct_pos[4] = {
             (y > 0) ? (center - width) : -1,
@@ -839,7 +874,6 @@ namespace LFMVS
             weight_norm = float(neigh_count);
         }
 
-        // current plane under fixed weights
         float4 best_plane = plane_prev[idx];
         float best_cost = cost_prev[idx];
         float4 best_disp = disp_prev[idx];
@@ -856,7 +890,6 @@ namespace LFMVS
             best_cost = ComputeWeightedCost_Frame(cost_vector_now, blur_vector_now, view_weights, neigh_count, disp_vector_now, best_disp);
         }
 
-        // same-view candidates under fixed weights
         for (int i = 0; i < 8; ++i)
         {
             if (!flag[i]) continue;
@@ -871,9 +904,11 @@ namespace LFMVS
             }
         }
 
-        // cross-view proposals: only compete under current fixed weights, do NOT re-select views
         for (int k = 0; k < neigh_count && k < max_neighbors; ++k)
         {
+            if (isSet(temp_selected_views, k) == 0)
+                continue;
+
             const int nvid = neighbor_ids[vid * max_neighbors + k];
             if (nvid < 0)
                 continue;
@@ -900,7 +935,6 @@ namespace LFMVS
             }
         }
 
-        // refinement under same fixed weights
         PlaneHypothesisRefinement_Frame(texture_objects, centers, tilekeys,
                                         neighbor_ids, neighbor_counts, max_neighbors,
                                         params, vid, p, &rand_states[idx], view_weights,
