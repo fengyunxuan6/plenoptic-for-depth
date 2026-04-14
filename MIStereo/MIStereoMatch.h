@@ -29,6 +29,7 @@ namespace LFMVS
         void StereoMatchingForMIA_SoftProxyRepair(QuadTreeProblemMapMap::iterator& itrFrame);
 
         void StereoMatchingForMIA_FrameCrossViews(QuadTreeProblemMapMap::iterator& itrFrame);
+        void StereoMatchingForMIA_FrameCrossViews_ACMM(QuadTreeProblemMapMap::iterator& itrFrame);
 
         // 匹配块补充（替换）+ 传播路径补充: softProxy and Propagation Graph Repair(边缘区域不完整Patch和传播路径的修复)
         void StereoMatchingForMIA_SoftProxyPGRRepair(QuadTreeProblemMapMap::iterator& itrFrame);
