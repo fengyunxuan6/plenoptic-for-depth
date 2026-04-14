@@ -2809,12 +2809,12 @@ namespace LFMVS {
         // Step 5: 虚拟深度图转真实深度图
         // TODO: 1.统计功能用到这里，来去噪声
         // 2.实现定量验证
-        // {
-        //     VirtualToRealDepthFunc VTRDFunction(this);
-        //     VTRDFunction.SetVirtualToRealDepthType(VTORD_Behavioralmodel);
-        //     VTRDFunction.SetSamplePointSelectType(SPSelectByLocalWindow);
-        //     VTRDFunction.VirtualToRealDepth(itrFrame);
-        // }
+         // {
+         //     VirtualToRealDepthFunc VTRDFunction(this);
+         //     VTRDFunction.SetVirtualToRealDepthType(VTORD_SegmentBehavioralmodel);
+         //     VTRDFunction.SetSamplePointSelectType(SPSelectByRandom);
+         //     VTRDFunction.VirtualToRealDepth(itrFrame);
+         // }
     }
 
         void DepthSolver::ProcessProblemsImp(bool geom_consistency)
