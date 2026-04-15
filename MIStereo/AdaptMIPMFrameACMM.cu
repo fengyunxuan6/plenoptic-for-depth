@@ -2,7 +2,7 @@
 file base:      AdaptMIPMFrameACMM.cu
 author:         OpenAI + LZD workflow
 created:        2026/04/15
-purpose:        ACMM风格的整帧GPU版微图像视差匹配（v4：恢复原LF内核 + 加多尺度warm start）
+purpose:        ACMM-v5：保留原LF有效内核，仅在初始化阶段支持多尺度暖启动
 *********************************************************************/
 #include "AdaptMIPMFrameACMM.h"
 
@@ -34,56 +34,31 @@ namespace LFMVS
     }
 
     static __device__ __forceinline__ float4 EncodePlaneHypothesisFromDispPlaneDevice(
-        const int2 anchor,
-        const float alpha,
-        const float beta,
-        const float gamma)
+        const int2 anchor, const float alpha, const float beta, const float gamma)
     {
-        float nx = -alpha;
-        float ny = -beta;
-        float nz =  1.0f;
-
+        float nx = -alpha, ny = -beta, nz = 1.0f;
         const float inv_norm = rsqrtf(nx * nx + ny * ny + nz * nz + 1e-12f);
-        nx *= inv_norm;
-        ny *= inv_norm;
-        nz *= inv_norm;
-
+        nx *= inv_norm; ny *= inv_norm; nz *= inv_norm;
         const float d_anchor = alpha * anchor.x + beta * anchor.y + gamma;
         return make_float4(nx, ny, nz, d_anchor);
     }
 
-    static __device__ __forceinline__ float EvalDisparityAtPixel_Frame(
-        const float3& d_plane,
-        const int2& p)
+    static __device__ __forceinline__ float EvalDisparityAtPixel_Frame(const float3& d_plane, const int2& p)
     {
         return d_plane.x * p.x + d_plane.y * p.y + d_plane.z;
     }
 
-    static __device__ __forceinline__ float2 MapRefToSrcFast_Hex_Frame(
-        const int2& ref_pt,
-        const float disparity,
-        const float step_x,
-        const float step_y)
+    static __device__ __forceinline__ float2 MapRefToSrcFast_Hex_Frame(const int2& ref_pt, const float disparity,
+                                                                       const float step_x, const float step_y)
     {
-        return make_float2(
-            ref_pt.x + step_x * disparity,
-            ref_pt.y + step_y * disparity);
+        return make_float2(ref_pt.x + step_x * disparity, ref_pt.y + step_y * disparity);
     }
 
     static __device__ float ComputeBilateralNCC_Frame(
-        const cudaTextureObject_t ref_image,
-        const cudaTextureObject_t ref_blur_image,
-        const float2 c0,
-        const int2 tk0,
-        const cudaTextureObject_t src_image,
-        const cudaTextureObject_t src_blur_image,
-        const float2 c1,
-        const int2 tk1,
-        const int2 p,
-        const float4 plane_hypothesis,
-        const PatchMatchParamsLF params,
-        float2& blur_value,
-        float4& disparity_baseline)
+        const cudaTextureObject_t ref_image, const cudaTextureObject_t ref_blur_image, const float2 c0, const int2 tk0,
+        const cudaTextureObject_t src_image, const cudaTextureObject_t src_blur_image, const float2 c1, const int2 tk1,
+        const int2 p, const float4 plane_hypothesis, const PatchMatchParamsLF params,
+        float2& blur_value, float4& disparity_baseline)
     {
         const float cost_max = 2.0f;
         const int radius = params.patch_size / 2;
@@ -92,28 +67,20 @@ namespace LFMVS
         blur_value = make_float2(0.0f, 0.0f);
 
         float2 pt_anchor;
-        DisparityGeometricMapOperate_Hex(
-            c0, c1, p, plane_hypothesis, p, params,
-            pt_anchor, disparity_baseline, tk0, tk1);
+        DisparityGeometricMapOperate_Hex(c0, c1, p, plane_hypothesis, p, params,
+                                         pt_anchor, disparity_baseline, tk0, tk1);
 
         if (pt_anchor.x >= params.MLA_Mask_Width_Cuda || pt_anchor.x < 0.0f ||
             pt_anchor.y >= params.MLA_Mask_Height_Cuda || pt_anchor.y < 0.0f)
-        {
             return cost_max;
-        }
 
         const float3 d_plane = DisparityPlane(p, plane_hypothesis);
         const float inv_base = 1.0f / fmaxf(params.Base, 1e-6f);
         const float step_x = (c0.x - c1.x) * inv_base;
         const float step_y = (c0.y - c1.y) * inv_base;
 
-        float sum_ref = 0.0f;
-        float sum_ref_ref = 0.0f;
-        float sum_src = 0.0f;
-        float sum_src_src = 0.0f;
-        float sum_ref_src = 0.0f;
+        float sum_ref = 0.0f, sum_ref_ref = 0.0f, sum_src = 0.0f, sum_src_src = 0.0f, sum_ref_src = 0.0f;
         float bilateral_weight_sum = 0.0f;
-
         const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
 
         for (int i = -radius; i <= radius; i += params.radius_increment)
@@ -123,18 +90,13 @@ namespace LFMVS
                 const int2 ref_pt = make_int2(p.x + i, p.y + j);
                 if (ref_pt.x < 0 || ref_pt.x >= params.MLA_Mask_Width_Cuda ||
                     ref_pt.y < 0 || ref_pt.y >= params.MLA_Mask_Height_Cuda)
-                {
                     continue;
-                }
 
                 const float d = EvalDisparityAtPixel_Frame(d_plane, ref_pt);
                 const float2 src_pt = MapRefToSrcFast_Hex_Frame(ref_pt, d, step_x, step_y);
-
                 if (src_pt.x < 0.0f || src_pt.x >= params.MLA_Mask_Width_Cuda ||
                     src_pt.y < 0.0f || src_pt.y >= params.MLA_Mask_Height_Cuda)
-                {
                     continue;
-                }
 
                 const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
                 const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
@@ -144,10 +106,8 @@ namespace LFMVS
                 blur_value.x += ref_blur_v;
                 blur_value.y += src_blur_v;
 
-                const float weight = ComputeBilateralWeight(
-                    i, j, ref_pix, ref_center_pix,
-                    params.sigma_spatial, params.sigma_color);
-
+                const float weight = ComputeBilateralWeight(i, j, ref_pix, ref_center_pix,
+                                                            params.sigma_spatial, params.sigma_color);
                 sum_ref += weight * ref_pix;
                 sum_ref_ref += weight * ref_pix * ref_pix;
                 sum_src += weight * src_pix;
@@ -157,41 +117,26 @@ namespace LFMVS
             }
         }
 
-        if (bilateral_weight_sum <= 1e-6f)
-            return cost_max;
+        if (bilateral_weight_sum <= 1e-6f) return cost_max;
 
         const float inv = 1.0f / bilateral_weight_sum;
-        sum_ref *= inv;
-        sum_ref_ref *= inv;
-        sum_src *= inv;
-        sum_src_src *= inv;
+        sum_ref *= inv; sum_ref_ref *= inv;
+        sum_src *= inv; sum_src_src *= inv;
         sum_ref_src *= inv;
 
         const float var_ref = sum_ref_ref - sum_ref * sum_ref;
         const float var_src = sum_src_src - sum_src * sum_src;
-        const float kMinVar = 1e-5f;
-        if (var_ref < kMinVar || var_src < kMinVar)
-            return cost_max;
+        if (var_ref < 1e-5f || var_src < 1e-5f) return cost_max;
 
         const float covar_src_ref = sum_ref_src - sum_ref * sum_src;
-        const float var_ref_src = sqrtf(var_ref * var_src);
-        return clamp_cost(1.0f - covar_src_ref / var_ref_src);
+        return clamp_cost(1.0f - covar_src_ref / sqrtf(var_ref * var_src));
     }
 
     static __device__ void ComputeMultiViewCostVector_Frame(
-        const cudaTextureObjects* texture_objects,
-        const float2* centers,
-        const int2* tilekeys,
-        const int* neighbor_ids,
-        const int* neighbor_counts,
-        const int max_neighbors,
-        const PatchMatchParamsLF params,
-        const int ref_vid,
-        const int2 p,
-        const float4 plane_hypothesis,
-        float* cost_vector,
-        float2* blur_vector,
-        float4* disp_vector)
+        const cudaTextureObjects* texture_objects, const float2* centers, const int2* tilekeys,
+        const int* neighbor_ids, const int* neighbor_counts, const int max_neighbors,
+        const PatchMatchParamsLF params, const int ref_vid, const int2 p, const float4 plane_hypothesis,
+        float* cost_vector, float2* blur_vector, float4* disp_vector)
     {
         const cudaTextureObject_t* images = texture_objects[0].images;
         const cudaTextureObject_t* blur_images = texture_objects[0].blur_images;
@@ -224,12 +169,17 @@ namespace LFMVS
         }
     }
 
+    static __device__ __forceinline__ void setBit(unsigned int &input, const unsigned int n)
+    {
+        input |= (unsigned int)1 << n;
+    }
+    static __device__ __forceinline__ int isSet(unsigned int input, const unsigned int n)
+    {
+        return (input >> n) & 1u;
+    }
+
     static __device__ unsigned int ComputeSelectedViewsTopK_Frame(
-        const float* cost_vector,
-        const int neigh_count,
-        const int top_k,
-        float& mean_cost,
-        int& best_idx)
+        const float* cost_vector, const int neigh_count, const int top_k, float& mean_cost, int& best_idx)
     {
         best_idx = -1;
         int valid = 0;
@@ -238,34 +188,22 @@ namespace LFMVS
             if (cost_vector[i] < 2.0f)
             {
                 ++valid;
-                if (best_idx < 0 || cost_vector[i] < cost_vector[best_idx])
-                    best_idx = i;
+                if (best_idx < 0 || cost_vector[i] < cost_vector[best_idx]) best_idx = i;
             }
         }
-
         if (valid <= 0)
         {
             mean_cost = 2.0f;
             return 0;
         }
-
         const int k = min(valid, top_k);
         float tmp[32];
         for (int i = 0; i < neigh_count; ++i) tmp[i] = cost_vector[i];
         for (int i = neigh_count; i < 32; ++i) tmp[i] = 2.0f;
 
         for (int i = 0; i < k; ++i)
-        {
             for (int j = i + 1; j < neigh_count; ++j)
-            {
-                if (tmp[j] < tmp[i])
-                {
-                    const float t = tmp[i];
-                    tmp[i] = tmp[j];
-                    tmp[j] = t;
-                }
-            }
-        }
+                if (tmp[j] < tmp[i]) { const float t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
 
         mean_cost = 0.0f;
         for (int i = 0; i < k; ++i) mean_cost += tmp[i];
@@ -274,26 +212,16 @@ namespace LFMVS
 
         unsigned int mask = 0;
         for (int i = 0; i < neigh_count && i < 32; ++i)
-        {
-            if (cost_vector[i] <= threshold)
-                setBit(mask, i);
-        }
+            if (cost_vector[i] <= threshold) setBit(mask, i);
         return mask;
     }
 
     static __device__ float ComputeWeightedCost_Frame(
-        const float* cost_vector,
-        const float2* blur_vector,
-        const float* view_weights,
-        const int neigh_count,
-        float4* disp_vector,
-        float4& out_best_disp)
+        const float* cost_vector, const float2* blur_vector, const float* view_weights,
+        const int neigh_count, float4* disp_vector, float4& out_best_disp)
     {
-        float weight_norm = 0.0f;
-        float total = 0.0f;
-        float min_cost = 2.0f;
-        int min_idx = -1;
-
+        float weight_norm = 0.0f, total = 0.0f;
+        float min_cost = 2.0f; int min_idx = -1;
         for (int i = 0; i < neigh_count; ++i)
         {
             if (view_weights[i] > 0.0f)
@@ -307,42 +235,46 @@ namespace LFMVS
                 min_idx = i;
             }
         }
-
-        if (min_idx >= 0) out_best_disp = disp_vector[min_idx];
-        else out_best_disp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-
-        if (weight_norm <= 1e-6f)
-            return 2.0f;
+        out_best_disp = (min_idx >= 0) ? disp_vector[min_idx] : make_float4(0,0,0,0);
+        if (weight_norm <= 1e-6f) return 2.0f;
         return total / weight_norm;
     }
 
-    static __device__ bool BuildCrossViewPlaneProposal(
-        const float4* plane_prev,
-        const float2* centers,
-        const int2* tilekeys,
-        const int pixels_per_view,
-        const PatchMatchParamsLF params,
-        const int ref_vid,
-        const int neigh_vid,
-        const int2 p,
-        const float4 current_plane,
-        float4& out_plane)
-    {
-        float2 qf;
-        float4 tmp_disp;
-        DisparityGeometricMapOperate_Hex(
-            centers[ref_vid], centers[neigh_vid],
-            p, current_plane, p, params,
-            qf, tmp_disp,
-            tilekeys[ref_vid], tilekeys[neigh_vid]);
 
+    static __device__ void RecomputeSupportCostDisp_Frame(
+        const cudaTextureObjects* texture_objects, const float2* centers, const int2* tilekeys,
+        const int* neighbor_ids, const int* neighbor_counts, const int max_neighbors,
+        const PatchMatchParamsLF params, const int ref_vid, const int2 p, const float4 plane_hypothesis,
+        unsigned int& out_sel, float& out_cost, float4& out_disp)
+    {
+        const int neigh_count = neighbor_counts[ref_vid];
+        float cost_vector[32];
+        float2 blur_vector[32];
+        float4 disp_vector[32];
+        ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys,
+                                         neighbor_ids, neighbor_counts, max_neighbors,
+                                         params, ref_vid, p, plane_hypothesis,
+                                         cost_vector, blur_vector, disp_vector);
+
+        float mean_cost = 2.0f;
+        int best_idx = -1;
+        out_sel = ComputeSelectedViewsTopK_Frame(cost_vector, neigh_count, params.top_k, mean_cost, best_idx);
+        out_cost = mean_cost;
+        out_disp = (best_idx >= 0) ? disp_vector[best_idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    static __device__ bool BuildCrossViewPlaneProposal(
+        const float4* plane_prev, const float2* centers, const int2* tilekeys, const int pixels_per_view,
+        const PatchMatchParamsLF params, const int ref_vid, const int neigh_vid,
+        const int2 p, const float4 current_plane, float4& out_plane)
+    {
+        float2 qf; float4 tmp_disp;
+        DisparityGeometricMapOperate_Hex(centers[ref_vid], centers[neigh_vid], p, current_plane, p, params,
+                                         qf, tmp_disp, tilekeys[ref_vid], tilekeys[neigh_vid]);
         const int qx = (int)floorf(qf.x + 0.5f);
         const int qy = (int)floorf(qf.y + 0.5f);
-        if (qx < 0 || qx >= params.MLA_Mask_Width_Cuda ||
-            qy < 0 || qy >= params.MLA_Mask_Height_Cuda)
-        {
+        if (qx < 0 || qx >= params.MLA_Mask_Width_Cuda || qy < 0 || qy >= params.MLA_Mask_Height_Cuda)
             return false;
-        }
 
         const int2 q = make_int2(qx, qy);
         const int q_local = q.y * params.MLA_Mask_Width_Cuda + q.x;
@@ -354,48 +286,33 @@ namespace LFMVS
 
         const float du = centers[ref_vid].x - centers[neigh_vid].x;
         const float dv = centers[ref_vid].y - centers[neigh_vid].y;
-
         float denom = 1.0f + alpha * du + beta * dv;
         denom = SafeDenomDevice(denom);
 
         const float aR = alpha / denom;
         const float bR = beta  / denom;
         const float cR = gamma / denom;
-
         out_plane = EncodePlaneHypothesisFromDispPlaneDevice(p, aR, bR, cR);
         return true;
     }
 
     static __device__ void PlaneHypothesisRefinement_Frame(
-        const cudaTextureObjects* texture_objects,
-        const float2* centers,
-        const int2* tilekeys,
-        const int* neighbor_ids,
-        const int* neighbor_counts,
-        const int max_neighbors,
-        const PatchMatchParamsLF params,
-        const int ref_vid,
-        const int2 p,
-        curandState* rand_state,
-        const float* view_weights,
-        float4& best_plane,
-        float& best_cost,
-        float4& best_disp)
+        const cudaTextureObjects* texture_objects, const float2* centers, const int2* tilekeys,
+        const int* neighbor_ids, const int* neighbor_counts, const int max_neighbors,
+        const PatchMatchParamsLF params, const int ref_vid, const int2 p, curandState* rand_state,
+        const float* view_weights, float4& best_plane, float& best_cost, float4& best_disp)
     {
         const int neigh_count = neighbor_counts[ref_vid];
-        if (neigh_count <= 0)
-            return;
+        if (neigh_count <= 0) return;
 
         const float perturbation = 0.02f;
         float depth_now = best_plane.w;
         float depth_rand;
+        float4 plane_rand_normal;
+        if (best_cost < 0.1f) depth_rand = (curand_uniform(rand_state) - 0.5f) * 2.0f + depth_now;
+        else depth_rand = curand_uniform(rand_state) * (params.depth_max - params.depth_min) + params.depth_min;
 
-        if (best_cost < 0.1f)
-            depth_rand = (curand_uniform(rand_state) - 0.5f) * 2.0f + depth_now;
-        else
-            depth_rand = curand_uniform(rand_state) * (params.depth_max - params.depth_min) + params.depth_min;
-
-        float4 plane_rand_normal = GenerateRandomNormalLF(p, rand_state, depth_now);
+        plane_rand_normal = GenerateRandomNormalLF(p, rand_state, depth_now);
         float4 plane_perturbed = GeneratePerturbedNormalLF(p, best_plane, rand_state, perturbation * M_PI);
 
         float depth_perturbed = depth_now;
@@ -405,7 +322,7 @@ namespace LFMVS
 
         const int num_planes = 5;
         float4 candidates[num_planes];
-        candidates[0] = GenerateRandomPlaneHypothesis_MIPM(p, rand_state, params.disparity_min, params.disparity_max);
+        candidates[0] = GenerateRandomPlaneHypothesis_MIPM(p, rand_state, params.depth_min, params.depth_max);
         candidates[1] = plane_rand_normal;
         candidates[2] = plane_perturbed;
         candidates[3] = best_plane;
@@ -438,98 +355,57 @@ namespace LFMVS
         }
     }
 
-    __global__ void InitializeFrameACMM_WarmOrRandom(
-        cudaTextureObjects* texture_objects,
-        float2* centers,
-        int2* tilekeys,
-        int* neighbor_ids,
-        int* neighbor_counts,
-        int max_neighbors,
-        float4* plane_prev,
-        float* cost_prev,
-        float4* disp_prev,
-        unsigned int* selected_prev,
-        const float4* plane_init,
-        const float* cost_init,
-        const float4* disp_init,
-        const unsigned int* selected_init,
-        curandState* rand_states,
-        const PatchMatchParamsLF params,
-        const int width,
-        const int height,
-        const int num_views,
-        const bool use_warm_start)
+    __global__ void InitializeFrameFromRandomOrWarm(
+        cudaTextureObjects* texture_objects, float2* centers, int2* tilekeys,
+        int* neighbor_ids, int* neighbor_counts, int max_neighbors,
+        float4* plane_prev, float* cost_prev, float4* disp_prev, unsigned int* selected_prev,
+        const float4* plane_init, const float* cost_init, const float4* disp_init, const unsigned int* selected_init,
+        curandState* rand_states, const PatchMatchParamsLF params,
+        const int width, const int height, const int num_views, const bool use_warm_start)
     {
         const int x = blockIdx.x * blockDim.x + threadIdx.x;
         const int y = blockIdx.y * blockDim.y + threadIdx.y;
         const int vid = blockIdx.z;
-        if (vid >= num_views || x >= width || y >= height)
-            return;
+        if (vid >= num_views || x >= width || y >= height) return;
 
         const int pixels_per_view = width * height;
         const int idx = FrameIndex(vid, x, y, width, pixels_per_view);
         const int2 p = make_int2(x, y);
+
         curand_init(clock64(), (unsigned long long)vid * (unsigned long long)pixels_per_view + idx, 0, &rand_states[idx]);
 
-        if (use_warm_start)
-        {
-            float4 plane = plane_init[idx];
-            if (!(plane.w >= params.disparity_min && plane.w <= params.disparity_max))
-                plane = GenerateRandomPlaneHypothesis_MIPM(p, &rand_states[idx], params.disparity_min, params.disparity_max);
+        float4 plane = use_warm_start ? plane_init[idx]
+                                      : GenerateRandomPlaneHypothesis_MIPM(p, &rand_states[idx], params.depth_min, params.depth_max);
 
-            plane_prev[idx] = plane;
-            cost_prev[idx] = cost_init[idx];
-            disp_prev[idx] = disp_init[idx];
-            selected_prev[idx] = selected_init[idx];
-            return;
-        }
+        if (!(plane.w >= params.disparity_min && plane.w <= params.disparity_max))
+            plane = GenerateRandomPlaneHypothesis_MIPM(p, &rand_states[idx], params.depth_min, params.depth_max);
 
-        float4 plane = GenerateRandomPlaneHypothesis_MIPM(p, &rand_states[idx], params.disparity_min, params.disparity_max);
-        float cost_vector[32];
-        float2 blur_vector[32];
-        float4 disp_vector[32];
-        ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys,
-                                         neighbor_ids, neighbor_counts, max_neighbors,
-                                         params, vid, p, plane,
-                                         cost_vector, blur_vector, disp_vector);
+        unsigned int sel = 0;
         float mean_cost = 2.0f;
-        int best_idx = -1;
-        unsigned int sel = ComputeSelectedViewsTopK_Frame(cost_vector, neighbor_counts[vid], params.top_k, mean_cost, best_idx);
+        float4 best_disp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        RecomputeSupportCostDisp_Frame(texture_objects, centers, tilekeys,
+                                       neighbor_ids, neighbor_counts, max_neighbors,
+                                       params, vid, p, plane,
+                                       sel, mean_cost, best_disp);
 
         plane_prev[idx] = plane;
         cost_prev[idx] = mean_cost;
-        disp_prev[idx] = (best_idx >= 0) ? disp_vector[best_idx] : make_float4(0,0,0,0);
+        disp_prev[idx] = best_disp;
         selected_prev[idx] = sel;
     }
 
     __global__ void CheckerboardUpdateFrame(
-        cudaTextureObjects* texture_objects,
-        float2* centers,
-        int2* tilekeys,
-        int* neighbor_ids,
-        int* neighbor_counts,
-        int max_neighbors,
-        const float4* plane_prev,
-        const float* cost_prev,
-        const float4* disp_prev,
-        const unsigned int* selected_prev,
-        float4* plane_next,
-        float* cost_next,
-        float4* disp_next,
-        unsigned int* selected_next,
-        curandState* rand_states,
-        const PatchMatchParamsLF params,
-        const int width,
-        const int height,
-        const int num_views,
-        const int iter,
-        const int phase)
+        cudaTextureObjects* texture_objects, float2* centers, int2* tilekeys,
+        int* neighbor_ids, int* neighbor_counts, int max_neighbors,
+        const float4* plane_prev, const float* cost_prev, const float4* disp_prev, const unsigned int* selected_prev,
+        float4* plane_next, float* cost_next, float4* disp_next, unsigned int* selected_next,
+        curandState* rand_states, const PatchMatchParamsLF params,
+        const int width, const int height, const int num_views, const int iter, const int phase)
     {
         const int x = blockIdx.x * blockDim.x + threadIdx.x;
         const int y = blockIdx.y * blockDim.y + threadIdx.y;
         const int vid = blockIdx.z;
-        if (vid >= num_views || x >= width || y >= height)
-            return;
+        if (vid >= num_views || x >= width || y >= height) return;
 
         const int pixels_per_view = width * height;
         const int idx = FrameIndex(vid, x, y, width, pixels_per_view);
@@ -574,14 +450,10 @@ namespace LFMVS
         const int farDis = 2;
         const int nerDis = 2;
         const int center = y * width + x;
-        int left_near = center - 1;
-        int left_far = center - 3;
-        int right_near = center + 1;
-        int right_far = center + 3;
-        int up_near = center - width;
-        int up_far = center - 3 * width;
-        int down_near = center + width;
-        int down_far = center + 3 * width;
+        int left_near = center - 1, left_far = center - 3;
+        int right_near = center + 1, right_far = center + 3;
+        int up_near = center - width, up_far = center - 3 * width;
+        int down_near = center + width, down_far = center + 3 * width;
 
         float costMin;
         int costMinPoint;
@@ -592,17 +464,12 @@ namespace LFMVS
             costMin = cost_prev[FrameIndex1D(vid, up_far, pixels_per_view)];
             costMinPoint = up_far;
             for (int i = 1; i < farDis; ++i)
-            {
                 if (y > 2 + i)
                 {
                     const int pointTemp = up_far - i * width;
                     if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
-                    {
-                        costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)];
-                        costMinPoint = pointTemp;
-                    }
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
-            }
             up_far = costMinPoint; positions[1] = up_far;
             ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys, neighbor_ids, neighbor_counts, max_neighbors, params,
                                              vid, p, plane_prev[FrameIndex1D(vid, up_far, pixels_per_view)], cost_array[1], blur_array[1], disp_array[1]);
@@ -613,17 +480,12 @@ namespace LFMVS
             costMin = cost_prev[FrameIndex1D(vid, down_far, pixels_per_view)];
             costMinPoint = down_far;
             for (int i = 1; i < farDis; ++i)
-            {
                 if (y < height - 3 - i)
                 {
                     const int pointTemp = down_far + i * width;
                     if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
-                    {
-                        costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)];
-                        costMinPoint = pointTemp;
-                    }
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
-            }
             down_far = costMinPoint; positions[3] = down_far;
             ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys, neighbor_ids, neighbor_counts, max_neighbors, params,
                                              vid, p, plane_prev[FrameIndex1D(vid, down_far, pixels_per_view)], cost_array[3], blur_array[3], disp_array[3]);
@@ -634,17 +496,12 @@ namespace LFMVS
             costMin = cost_prev[FrameIndex1D(vid, left_far, pixels_per_view)];
             costMinPoint = left_far;
             for (int i = 1; i < farDis; ++i)
-            {
                 if (x > 2 + i)
                 {
                     const int pointTemp = left_far - i;
                     if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
-                    {
-                        costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)];
-                        costMinPoint = pointTemp;
-                    }
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
-            }
             left_far = costMinPoint; positions[5] = left_far;
             ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys, neighbor_ids, neighbor_counts, max_neighbors, params,
                                              vid, p, plane_prev[FrameIndex1D(vid, left_far, pixels_per_view)], cost_array[5], blur_array[5], disp_array[5]);
@@ -655,17 +512,12 @@ namespace LFMVS
             costMin = cost_prev[FrameIndex1D(vid, right_far, pixels_per_view)];
             costMinPoint = right_far;
             for (int i = 1; i < farDis; ++i)
-            {
                 if (x < width - 3 - i)
                 {
                     const int pointTemp = right_far + i;
                     if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
-                    {
-                        costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)];
-                        costMinPoint = pointTemp;
-                    }
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
-            }
             right_far = costMinPoint; positions[7] = right_far;
             ComputeMultiViewCostVector_Frame(texture_objects, centers, tilekeys, neighbor_ids, neighbor_counts, max_neighbors, params,
                                              vid, p, plane_prev[FrameIndex1D(vid, right_far, pixels_per_view)], cost_array[7], blur_array[7], disp_array[7]);
@@ -680,12 +532,14 @@ namespace LFMVS
                 if (y > 1 + i && x > i)
                 {
                     const int pointTemp = up_near - (1 + i) * width - i;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
                 if (y > 1 + i && x < width - 1 - i)
                 {
                     const int pointTemp = up_near - (1 + i) * width + i;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
             }
             up_near = costMinPoint; positions[0] = up_near;
@@ -707,12 +561,14 @@ namespace LFMVS
                 if (y < height - 2 - i && x > i)
                 {
                     const int pointTemp = down_near + (1 + i) * width - i;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
                 if (y < height - 2 - i && x < width - 1 - i)
                 {
                     const int pointTemp = down_near + (1 + i) * width + i;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
             }
             down_near = costMinPoint; positions[2] = down_near;
@@ -734,12 +590,14 @@ namespace LFMVS
                 if (x > 1 + i && y > i)
                 {
                     const int pointTemp = left_near - (1 + i) - i * width;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
                 if (x > 1 + i && y < height - 1 - i)
                 {
                     const int pointTemp = left_near - (1 + i) + i * width;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
             }
             left_near = costMinPoint; positions[4] = left_near;
@@ -761,12 +619,14 @@ namespace LFMVS
                 if (x < width - 2 - i && y > i)
                 {
                     const int pointTemp = right_near + (1 + i) - i * width;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
                 if (x < width - 2 - i && y < height - 1 - i)
                 {
                     const int pointTemp = right_near + (1 + i) + i * width;
-                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin) { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
+                    if (cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)] < costMin)
+                    { costMin = cost_prev[FrameIndex1D(vid, pointTemp, pixels_per_view)]; costMinPoint = pointTemp; }
                 }
             }
             right_near = costMinPoint; positions[6] = right_near;
@@ -791,21 +651,14 @@ namespace LFMVS
         {
             if (direct_pos[ii] < 0 || !flag[same_flags[ii]]) continue;
             for (int j = 0; j < neigh_count; ++j)
-            {
-                if (isSet(selected_prev[FrameIndex1D(vid, direct_pos[ii], pixels_per_view)], j) == 1)
-                    view_selection_priors[j] += 0.9f;
-                else
-                    view_selection_priors[j] += 0.1f;
-            }
+                view_selection_priors[j] += isSet(selected_prev[FrameIndex1D(vid, direct_pos[ii], pixels_per_view)], j) ? 0.9f : 0.1f;
         }
 
         float sampling_probs[32] = {0.0f};
         const float cost_threshold = 0.8f * expf((iter) * (iter) / (-90.0f));
         for (int i = 0; i < neigh_count; ++i)
         {
-            float count = 0.0f;
-            int count_false = 0;
-            float tmpw = 0.0f;
+            float count = 0.0f; int count_false = 0; float tmpw = 0.0f;
             for (int j = 0; j < 8; ++j)
             {
                 if (!flag[j]) continue;
@@ -816,10 +669,8 @@ namespace LFMVS
                 }
                 if (cost_array[j][i] > 1.2f) count_false++;
             }
-            if (count > 2.0f && count_false < 3)
-                sampling_probs[i] = tmpw / count;
-            else if (count_false < 3)
-                sampling_probs[i] = expf(cost_threshold * cost_threshold / (-0.32f));
+            if (count > 2.0f && count_false < 3) sampling_probs[i] = tmpw / count;
+            else if (count_false < 3) sampling_probs[i] = expf(cost_threshold * cost_threshold / (-0.32f));
             sampling_probs[i] *= view_selection_priors[i];
         }
 
@@ -830,8 +681,7 @@ namespace LFMVS
             const float rand_prob = curand_uniform(&rand_states[idx]) - FLT_EPSILON;
             for (int image_id = 0; image_id < neigh_count; ++image_id)
             {
-                const float prob = sampling_probs[image_id];
-                if (prob > rand_prob)
+                if (sampling_probs[image_id] > rand_prob)
                 {
                     view_weights[image_id] += 1.0f;
                     break;
@@ -851,12 +701,7 @@ namespace LFMVS
         }
         if (weight_norm <= 0.0f)
         {
-            for (int i = 0; i < neigh_count; ++i)
-            {
-                view_weights[i] = 1.0f;
-                setBit(temp_selected_views, i);
-            }
-            weight_norm = float(neigh_count);
+            for (int i = 0; i < neigh_count; ++i) { view_weights[i] = 1.0f; setBit(temp_selected_views, i); }
         }
 
         float4 best_plane = plane_prev[idx];
@@ -891,12 +736,9 @@ namespace LFMVS
 
         for (int k = 0; k < neigh_count && k < max_neighbors; ++k)
         {
-            if (isSet(temp_selected_views, k) == 0)
-                continue;
-
+            if (isSet(temp_selected_views, k) == 0) continue;
             const int nvid = neighbor_ids[vid * max_neighbors + k];
-            if (nvid < 0)
-                continue;
+            if (nvid < 0) continue;
 
             float4 proxy_plane;
             if (!BuildCrossViewPlaneProposal(plane_prev, centers, tilekeys, pixels_per_view, params, vid, nvid, p, best_plane, proxy_plane))
@@ -925,10 +767,48 @@ namespace LFMVS
                                         params, vid, p, &rand_states[idx], view_weights,
                                         best_plane, best_cost, best_disp);
 
+        // v5.1：
+        // 传播/采样阶段用的是一套“临时视图权重”来比较候选，但写回阶段必须让
+        // plane / cost / selected_views / disp_v 对同一个最终 plane 重新对齐。
+        // 否则不过滤时能看到弱结构，而一过滤就会因 metadata 不一致被大量清空。
+        RecomputeSupportCostDisp_Frame(texture_objects, centers, tilekeys,
+                                       neighbor_ids, neighbor_counts, max_neighbors,
+                                       params, vid, p, best_plane,
+                                       best_sel, best_cost, best_disp);
+
         plane_next[idx] = best_plane;
         cost_next[idx] = best_cost;
         disp_next[idx] = best_disp;
         selected_next[idx] = best_sel;
+    }
+
+
+    __global__ void PostRefineMetadataFrame(
+        cudaTextureObjects* texture_objects, float2* centers, int2* tilekeys,
+        int* neighbor_ids, int* neighbor_counts, int max_neighbors,
+        float4* plane_prev, float* cost_prev, float4* disp_prev, unsigned int* selected_prev,
+        const PatchMatchParamsLF params, const int width, const int height, const int num_views)
+    {
+        const int x = blockIdx.x * blockDim.x + threadIdx.x;
+        const int y = blockIdx.y * blockDim.y + threadIdx.y;
+        const int vid = blockIdx.z;
+        if (vid >= num_views || x >= width || y >= height) return;
+
+        const int pixels_per_view = width * height;
+        const int idx = FrameIndex(vid, x, y, width, pixels_per_view);
+        const int2 p = make_int2(x, y);
+
+        unsigned int sel = 0;
+        float cost = 2.0f;
+        float4 disp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        RecomputeSupportCostDisp_Frame(texture_objects, centers, tilekeys,
+                                       neighbor_ids, neighbor_counts, max_neighbors,
+                                       params, vid, p, plane_prev[idx],
+                                       sel, cost, disp);
+
+        cost_prev[idx] = cost;
+        disp_prev[idx] = disp;
+        selected_prev[idx] = sel;
     }
 
     void RunPatchMatchCUDAForFrameACMM_Impl(cudaTextureObjects* texture_objects_cuda,
@@ -937,7 +817,7 @@ namespace LFMVS
         float4* disp_prev_cuda, float4* disp_next_cuda, unsigned int* selected_prev_cuda, unsigned int* selected_next_cuda,
         float4* plane_init_cuda, float* cost_init_cuda, float4* disp_init_cuda, unsigned int* selected_init_cuda,
         curandState* rand_states_cuda, PatchMatchParamsLF params, int num_views, int max_neighbors,
-        bool use_warm_start)
+        bool use_warm_start, float lambda_scale, float lambda_geo, float detail_th, float geom_clip)
     {
         const int width = params.MLA_Mask_Width_Cuda;
         const int height = params.MLA_Mask_Height_Cuda;
@@ -946,7 +826,7 @@ namespace LFMVS
                        (height + block_size.y - 1) / block_size.y,
                        num_views);
 
-        InitializeFrameACMM_WarmOrRandom<<<grid_size, block_size>>>(
+        InitializeFrameFromRandomOrWarm<<<grid_size, block_size>>>(
             texture_objects_cuda, centers_cuda, tilekeys_cuda,
             neighbor_ids_cuda, neighbor_counts_cuda, max_neighbors,
             plane_prev_cuda, cost_prev_cuda, disp_prev_cuda, selected_prev_cuda,
@@ -980,5 +860,13 @@ namespace LFMVS
             std::swap(disp_prev_cuda, disp_next_cuda);
             std::swap(selected_prev_cuda, selected_next_cuda);
         }
+
+        // 再做一次全局 metadata 对齐，保证最终输出的 plane / cost / selected_views / disp_v 完全一致。
+        PostRefineMetadataFrame<<<grid_size, block_size>>>(
+            texture_objects_cuda, centers_cuda, tilekeys_cuda,
+            neighbor_ids_cuda, neighbor_counts_cuda, max_neighbors,
+            plane_prev_cuda, cost_prev_cuda, disp_prev_cuda, selected_prev_cuda,
+            params, width, height, num_views);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 }
