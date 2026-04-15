@@ -11,6 +11,7 @@ purpose:        ACMM风格的整帧GPU版微图像视差匹配（多尺度 + 模
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace LFMVS
@@ -431,8 +432,15 @@ namespace LFMVS
         CUDA_SAFE_CALL(cudaMalloc((void**)&texture_objects_cuda, sizeof(cudaTextureObjects)));
         CUDA_SAFE_CALL(cudaMemcpy(texture_objects_cuda, &texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice));
 
+        std::vector<float2> level_centers(m_num_views);
+        for (int vid = 0; vid < m_num_views; ++vid)
+        {
+            level_centers[vid] = make_float2(centerPointS_MI[vid].x * level.scale,
+                                             centerPointS_MI[vid].y * level.scale);
+        }
+
         CUDA_SAFE_CALL(cudaMalloc((void**)&centers_cuda, sizeof(float2) * m_num_views));
-        CUDA_SAFE_CALL(cudaMemcpy(centers_cuda, centerPointS_MI, sizeof(float2) * m_num_views, cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(centers_cuda, level_centers.data(), sizeof(float2) * m_num_views, cudaMemcpyHostToDevice));
 
         CUDA_SAFE_CALL(cudaMalloc((void**)&tilekeys_cuda, sizeof(int2) * m_num_views));
         CUDA_SAFE_CALL(cudaMemcpy(tilekeys_cuda, tileKeyS_MI, sizeof(int2) * m_num_views, cudaMemcpyHostToDevice));
@@ -508,6 +516,7 @@ namespace LFMVS
 
         const float sx = (float)prev_level.width / std::max(1, cur_level.width);
         const float sy = (float)prev_level.height / std::max(1, cur_level.height);
+        const float disp_scale = cur_level.scale / std::max(prev_level.scale, 1e-6f);
 
         for (int vid = 0; vid < m_num_views; ++vid)
         {
@@ -519,9 +528,11 @@ namespace LFMVS
                     const int px = std::min(prev_level.width - 1, (int)std::floor(x * sx));
                     const int prev_idx = vid * prev_pixels + py * prev_level.width + px;
                     const int cur_idx = vid * cur_pixels + y * cur_level.width + x;
-                    plane_init_host[cur_idx] = plane_level_host[prev_idx];
+
+                    const float disp_seed = plane_level_host[prev_idx].w * disp_scale;
+                    plane_init_host[cur_idx] = make_float4(0.0f, 0.0f, 1.0f, disp_seed);
                     cost_init_host[cur_idx] = cost_level_host[prev_idx];
-                    disp_init_host[cur_idx] = disp_level_host[prev_idx];
+                    disp_init_host[cur_idx] = make_float4(0.0f, 0.0f, 0.0f, disp_seed);
                     selected_init_host[cur_idx] = selected_level_host[prev_idx];
                 }
             }
@@ -580,15 +591,51 @@ namespace LFMVS
             }
             UploadWarmStartToGPU();
 
+            const float lambda_geo_eff = (lid == 0) ? 0.0f : m_lambda_geo;
+
             RunPatchMatchCUDAForFrameACMM_Impl(texture_objects_cuda,
                 centers_cuda, tilekeys_cuda, neighbor_ids_cuda, neighbor_counts_cuda,
                 plane_prev_cuda, plane_next_cuda, cost_prev_cuda, cost_next_cuda,
                 disp_prev_cuda, disp_next_cuda, selected_prev_cuda, selected_next_cuda,
                 plane_init_cuda, cost_init_cuda, disp_init_cuda, selected_init_cuda,
                 rand_states_cuda, params, m_num_views, m_max_neighbors,
-                (lid > 0), m_lambda_scale, m_lambda_geo, m_detail_th, m_geom_clip);
+                (lid > 0), m_lambda_scale, lambda_geo_eff, m_detail_th, m_geom_clip);
 
             DownloadCurrentLevelResults();
+
+            if (!cost_level_host.empty())
+            {
+                float cost_min = std::numeric_limits<float>::max();
+                float cost_max = -std::numeric_limits<float>::max();
+                float disp_min = std::numeric_limits<float>::max();
+                float disp_max = -std::numeric_limits<float>::max();
+                double cost_mean = 0.0;
+                double disp_mean = 0.0;
+                size_t valid_selected = 0;
+                size_t good_cost = 0;
+
+                for (size_t i = 0; i < cost_level_host.size(); ++i)
+                {
+                    const float c = cost_level_host[i];
+                    const float d = plane_level_host[i].w;
+                    cost_min = std::min(cost_min, c);
+                    cost_max = std::max(cost_max, c);
+                    disp_min = std::min(disp_min, d);
+                    disp_max = std::max(disp_max, d);
+                    cost_mean += c;
+                    disp_mean += d;
+                    if (selected_level_host[i] != 0) ++valid_selected;
+                    if (c < 1.8f) ++good_cost;
+                }
+
+                const double denom = std::max<size_t>(1, cost_level_host.size());
+                LOG_INFO("ACMM level=", lid,
+                         ", scale=", m_pyramid_levels[lid].scale,
+                         ", valid_selected_ratio=", (double)valid_selected / denom,
+                         ", good_cost_ratio=", (double)good_cost / denom,
+                         ", cost[min/mean/max]=", cost_min, "/", cost_mean / denom, "/", cost_max,
+                         ", disp[min/mean/max]=", disp_min, "/", disp_mean / denom, "/", disp_max);
+            }
         }
 
         const ACMMFrameLevelHostData& last_level = m_pyramid_levels.back();
