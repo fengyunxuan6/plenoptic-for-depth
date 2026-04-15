@@ -695,7 +695,7 @@ namespace LFMVS
         LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews, End");
     }
 
-   void MIStereoMatch::StereoMatchingForMIA_FrameCrossViews_ACMM(QuadTreeProblemMapMap::iterator& itrFrame)
+  void MIStereoMatch::StereoMatchingForMIA_FrameCrossViews_ACMM(QuadTreeProblemMapMap::iterator& itrFrame)
 {
     LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews_ACMM, Begin");
 
@@ -737,34 +737,31 @@ namespace LFMVS
     adapt_frame_ACMM.WriteBackResults(disNormals_map);
     adapt_frame_ACMM.ReleaseMemory();
 
-    const bool bEnableFilterAfterACMM = false;
-    if (!bEnableFilterAfterACMM)
-    {
-        LOG_ERROR("ACMM debug: skip FilterGlobal once, inspect raw disparity / raw virtual depth first.");
-        LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews_ACMM, End (raw result only)");
-        return;
-    }
-
+    // v5.1：当前会先重算最终 plane 对应的 selected_views / cost，再走一遍轻过滤。
+    // 过滤仍然比原 FrameCrossViews 放宽，但不再完全忽略 selected_views。
     MIDisparityFilterConfig fcfg;
     fcfg.max_triplet = 4;
     fcfg.min_valid_disp = 0.0f;
     fcfg.use_selected_views_only = true;
-    fcfg.clear_selected_views_when_invalid = true;
+    fcfg.clear_selected_views_when_invalid = false;
+
     fcfg.enable_cost_filter = true;
-    fcfg.max_cost = 1.8f;
-    fcfg.enable_cycle_geo_filter = true;
-    fcfg.max_geo_err_px = 0.5;
-    fcfg.enable_cycle_photo_filter = true;
-    fcfg.max_photo_err_u = 0.5;
-    fcfg.min_good_neighbors = 2;
+    fcfg.max_cost = 1.90f;
+
+    fcfg.enable_cycle_geo_filter = false;
+    fcfg.max_geo_err_px = 1.0;
+    fcfg.enable_cycle_photo_filter = false;
+    fcfg.max_photo_err_u = 1.0;
+    fcfg.min_good_neighbors = 1;
+
     fcfg.enable_spike_filter = true;
-    fcfg.spike_abs_diff = 1.0f;
-    fcfg.spike_min_neighbors = 3;
+    fcfg.spike_abs_diff = 2.0f;
+    fcfg.spike_min_neighbors = 2;
     fcfg.dump_debug_mask = (g_Debug_Static >= 1);
 
     MIDisparityFilterStats filter_stats;
     std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-                + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
+                + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter_ACMM";
     MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
     filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
                         disNormals_map, fcfg, filter_stats,
