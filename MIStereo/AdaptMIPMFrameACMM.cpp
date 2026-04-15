@@ -1,8 +1,8 @@
 /********************************************************************
 file base:      AdaptMIPMFrameACMM.cpp
 author:         OpenAI + LZD workflow
-created:        2026/04/14
-purpose:        ACMM风格的整帧GPU版微图像视差匹配（多尺度 + 模糊分组/对齐）
+created:        2026/04/15
+purpose:        ACMM风格的整帧GPU版微图像视差匹配（重写版，先保证几何/尺度/搜索范围一致）
 *********************************************************************/
 #include "AdaptMIPMFrameACMM.h"
 
@@ -24,9 +24,9 @@ namespace LFMVS
         , m_num_levels(3)
         , m_current_level(-1)
         , m_bReleased(false)
-        , m_lambda_scale(0.35f)
-        , m_lambda_geo(0.15f)
-        , m_detail_th(0.12f)
+        , m_lambda_scale(0.20f)
+        , m_lambda_geo(0.10f)
+        , m_detail_th(0.05f)
         , m_geom_clip(2.0f)
         , m_blur_group_count(3)
         , centerPointS_MI(nullptr)
@@ -155,22 +155,30 @@ namespace LFMVS
     void AdaptMIPMFrameACMM::InitGPUParamsFromCPUParams(int level_id)
     {
         const ACMMFrameLevelHostData& level = m_pyramid_levels[level_id];
-        params.max_iterations = (level_id == 0) ? 6 : 4;
+        params.max_iterations = (level_id == 0) ? 5 : 4;
         params.patch_size = 5;
         params.patch_Bound_size = 5;
         params.propagation_Graph_size = 5;
-        params.num_images = m_max_neighbors + 1;
-        params.top_k = 5;
-        params.depth_min = 0.0f;
-        params.depth_max = m_ParamsCUDA.baseline * 0.5f;
-        params.disparity_min = 0.0f;
-        params.disparity_max = m_ParamsCUDA.baseline * 0.5f;
+        params.num_images = std::min(m_max_neighbors + 1, m_num_views);
+        params.top_k = std::min(4, std::max(1, params.num_images - 1));
+        params.depth_min = 5.0f;
+        params.depth_max = 40.0f;
+        params.disparity_min = 5.0f;
+        params.disparity_max = 40.0f;
         params.Base = m_ParamsCUDA.baseline * level.scale;
         params.MLA_Mask_Width_Cuda = level.width;
         params.MLA_Mask_Height_Cuda = level.height;
         params.base_height_ratio = 0.2f;
         params.base_height_sigma = 0.05f;
         params.geom_consistency = true;
+
+        LOG_INFO("ACMM params: level=", level_id,
+                 ", width=", level.width,
+                 ", height=", level.height,
+                 ", Base=", params.Base,
+                 ", num_images=", params.num_images,
+                 ", top_k=", params.top_k,
+                 ", disp_range=[", params.disparity_min, ", ", params.disparity_max, "]");
     }
 
     bool AdaptMIPMFrameACMM::BuildViewIndexMap(QuadTreeTileInfoMap& MLA_info_map, QuadTreeProblemMap& problem_map)
@@ -246,6 +254,8 @@ namespace LFMVS
             neighbor_counts_host[vid] = count;
         }
 
+        LOG_INFO("AdaptMIPMFrameACMM: valid micro-image views=", m_num_views,
+                 ", max_neighbors=", m_max_neighbors);
         return true;
     }
 
@@ -289,7 +299,7 @@ namespace LFMVS
             if (begin >= end)
                 continue;
 
-            float target_blur = mean_and_index[end - 1].first;
+            const float target_blur = mean_and_index[end - 1].first;
             for (int i = begin; i < end; ++i)
             {
                 const int vid = mean_and_index[i].second;
@@ -300,11 +310,6 @@ namespace LFMVS
                 cv::Mat img_aligned;
                 cv::GaussianBlur(level_data.images[vid], img_aligned, cv::Size(), sigma, sigma, cv::BORDER_REPLICATE);
                 level_data.images[vid] = img_aligned;
-
-                cv::Mat blur_aligned;
-                cv::GaussianBlur(level_data.blur_images[vid], blur_aligned, cv::Size(), sigma, sigma, cv::BORDER_REPLICATE);
-                level_data.blur_images[vid] = blur_aligned;
-                level_data.blur_mean[vid] = (float)cv::mean(level_data.blur_images[vid])[0];
             }
         }
     }
@@ -316,6 +321,7 @@ namespace LFMVS
 
         const int full_w = images_MI[0].cols;
         const int full_h = images_MI[0].rows;
+
         int max_levels = 1;
         int cur_w = full_w;
         int cur_h = full_h;
@@ -327,13 +333,14 @@ namespace LFMVS
                 break;
             ++max_levels;
         }
+
         m_num_levels = std::max(2, std::min(3, max_levels));
         m_pyramid_levels.clear();
         m_pyramid_levels.resize(m_num_levels);
 
         for (int lid = 0; lid < m_num_levels; ++lid)
         {
-            const int coarse_id = m_num_levels - 1 - lid; // lid=0 最粗层
+            const int coarse_id = m_num_levels - 1 - lid;
             const float scale = 1.0f / std::pow(2.0f, (float)coarse_id);
             const int width = std::max(8, (int)std::round(full_w * scale));
             const int height = std::max(8, (int)std::round(full_h * scale));
@@ -366,12 +373,12 @@ namespace LFMVS
 
     void AdaptMIPMFrameACMM::CreateGrayImageObject(int image_index, const cv::Mat& image_in)
     {
-        const int image_rows = image_in.rows;
-        const int image_cols = image_in.cols;
+        const int rows = image_in.rows;
+        const int cols = image_in.cols;
         cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-        cudaMallocArray(&cuArray[image_index], &channelDesc, image_cols, image_rows);
+        cudaMallocArray(&cuArray[image_index], &channelDesc, cols, rows);
         cudaMemcpy2DToArray(cuArray[image_index], 0, 0, image_in.ptr<float>(),
-                            image_in.step[0], image_cols * sizeof(float), image_rows, cudaMemcpyHostToDevice);
+                            image_in.step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice);
 
         struct cudaResourceDesc resDesc;
         memset(&resDesc, 0, sizeof(cudaResourceDesc));
@@ -380,8 +387,8 @@ namespace LFMVS
 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
-        texDesc.addressMode[0] = cudaAddressModeWrap;
-        texDesc.addressMode[1] = cudaAddressModeWrap;
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
         texDesc.filterMode = cudaFilterModeLinear;
         texDesc.readMode = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;
@@ -391,12 +398,12 @@ namespace LFMVS
 
     void AdaptMIPMFrameACMM::CreateBlurImageObject(int image_index, const cv::Mat& blur_in)
     {
-        const int image_rows = blur_in.rows;
-        const int image_cols = blur_in.cols;
+        const int rows = blur_in.rows;
+        const int cols = blur_in.cols;
         cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-        cudaMallocArray(&cu_blur_Array[image_index], &channelDesc, image_cols, image_rows);
+        cudaMallocArray(&cu_blur_Array[image_index], &channelDesc, cols, rows);
         cudaMemcpy2DToArray(cu_blur_Array[image_index], 0, 0, blur_in.ptr<float>(),
-                            blur_in.step[0], image_cols * sizeof(float), image_rows, cudaMemcpyHostToDevice);
+                            blur_in.step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice);
 
         struct cudaResourceDesc resDesc;
         memset(&resDesc, 0, sizeof(cudaResourceDesc));
@@ -405,8 +412,8 @@ namespace LFMVS
 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
-        texDesc.addressMode[0] = cudaAddressModeWrap;
-        texDesc.addressMode[1] = cudaAddressModeWrap;
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
         texDesc.filterMode = cudaFilterModeLinear;
         texDesc.readMode = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;
@@ -419,6 +426,13 @@ namespace LFMVS
         const ACMMFrameLevelHostData& level = m_pyramid_levels[level_id];
         m_pixels_per_view = level.width * level.height;
         const size_t frame_pixels = (size_t)m_pixels_per_view * (size_t)m_num_views;
+        if (m_pixels_per_view <= 0 || m_num_views <= 0 || frame_pixels == 0)
+        {
+            LOG_ERROR("AdaptMIPMFrameACMM::InitializeGPUForLevel invalid shape, level=", level_id,
+                      ", pixels_per_view=", m_pixels_per_view,
+                      ", num_views=", m_num_views);
+            return false;
+        }
 
         ReleaseGPUForCurrentLevel();
         memset(&texture_objects_host, 0, sizeof(texture_objects_host));
@@ -470,11 +484,15 @@ namespace LFMVS
         cost_level_host.resize(frame_pixels);
         disp_level_host.resize(frame_pixels);
         selected_level_host.resize(frame_pixels);
-        plane_init_host.resize(frame_pixels, make_float4(0, 0, 1, 0));
+
+        plane_init_host.resize(frame_pixels, make_float4(0, 0, 1, 10));
         cost_init_host.resize(frame_pixels, 2.0f);
-        disp_init_host.resize(frame_pixels, make_float4(0, 0, 0, 0));
+        disp_init_host.resize(frame_pixels, make_float4(0, 0, 0, 10));
         selected_init_host.resize(frame_pixels, 0);
 
+        LOG_INFO("ACMM level host buffers resized: level=", level_id,
+                 ", frame_pixels=", (double)frame_pixels,
+                 ", cost_level_host.size=", (double)cost_level_host.size());
         return true;
     }
 
@@ -490,6 +508,8 @@ namespace LFMVS
         cost_final_host = new float[frame_pixels_final];
         disp_final_host = new float4[frame_pixels_final];
         selected_final_host = new unsigned int[frame_pixels_final];
+        LOG_INFO("AdaptMIPMFrameACMM::Initialize success, final_frame_pixels=", (double)frame_pixels_final,
+                 ", levels=", m_num_levels, ", views=", m_num_views);
         return true;
     }
 
@@ -502,16 +522,16 @@ namespace LFMVS
 
         if ((int)plane_level_host.size() != prev_pixels * m_num_views)
         {
-            std::fill(plane_init_host.begin(), plane_init_host.end(), make_float4(0, 0, 1, 0));
+            std::fill(plane_init_host.begin(), plane_init_host.end(), make_float4(0, 0, 1, 10));
             std::fill(cost_init_host.begin(), cost_init_host.end(), 2.0f);
-            std::fill(disp_init_host.begin(), disp_init_host.end(), make_float4(0, 0, 0, 0));
+            std::fill(disp_init_host.begin(), disp_init_host.end(), make_float4(0, 0, 0, 10));
             std::fill(selected_init_host.begin(), selected_init_host.end(), 0);
             return;
         }
 
-        plane_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 1, 0));
+        plane_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 1, 10));
         cost_init_host.assign(cur_pixels * m_num_views, 2.0f);
-        disp_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 0, 0));
+        disp_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 0, 10));
         selected_init_host.assign(cur_pixels * m_num_views, 0);
 
         const float sx = (float)prev_level.width / std::max(1, cur_level.width);
@@ -551,6 +571,11 @@ namespace LFMVS
     void AdaptMIPMFrameACMM::DownloadCurrentLevelResults()
     {
         const size_t frame_pixels = (size_t)m_pixels_per_view * (size_t)m_num_views;
+        if (!plane_prev_cuda || !cost_prev_cuda || !disp_prev_cuda || !selected_prev_cuda)
+        {
+            LOG_ERROR("AdaptMIPMFrameACMM::DownloadCurrentLevelResults null device buffer.");
+            return;
+        }
         CUDA_SAFE_CALL(cudaMemcpy(plane_level_host.data(), plane_prev_cuda, sizeof(float4) * frame_pixels, cudaMemcpyDeviceToHost));
         CUDA_SAFE_CALL(cudaMemcpy(cost_level_host.data(), cost_prev_cuda, sizeof(float) * frame_pixels, cudaMemcpyDeviceToHost));
         CUDA_SAFE_CALL(cudaMemcpy(disp_level_host.data(), disp_prev_cuda, sizeof(float4) * frame_pixels, cudaMemcpyDeviceToHost));
@@ -580,9 +605,9 @@ namespace LFMVS
 
             if (lid == 0)
             {
-                std::fill(plane_init_host.begin(), plane_init_host.end(), make_float4(0, 0, 1, 0));
+                std::fill(plane_init_host.begin(), plane_init_host.end(), make_float4(0, 0, 1, 10));
                 std::fill(cost_init_host.begin(), cost_init_host.end(), 2.0f);
-                std::fill(disp_init_host.begin(), disp_init_host.end(), make_float4(0, 0, 0, 0));
+                std::fill(disp_init_host.begin(), disp_init_host.end(), make_float4(0, 0, 0, 10));
                 std::fill(selected_init_host.begin(), selected_init_host.end(), 0);
             }
             else
@@ -603,7 +628,12 @@ namespace LFMVS
 
             DownloadCurrentLevelResults();
 
-            if (!cost_level_host.empty())
+            if (cost_level_host.empty())
+            {
+                LOG_ERROR("ACMM level=", lid, " host buffers are empty after DownloadCurrentLevelResults. ",
+                          "pixels_per_view=", m_pixels_per_view, ", num_views=", m_num_views);
+            }
+            else
             {
                 float cost_min = std::numeric_limits<float>::max();
                 float cost_max = -std::numeric_limits<float>::max();
