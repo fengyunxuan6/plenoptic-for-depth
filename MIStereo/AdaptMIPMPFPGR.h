@@ -1,54 +1,132 @@
 /********************************************************************
-file base:      AdaptMIPMPFPGR.h
-author:         LZD
-created:        2025/07/12
-purpose:        微图像的视差计算
+file base:      AdaptMIPMFrameACMM.h
+author:         OpenAI + LZD workflow
+created:        2026/04/14
+purpose:        ACMM风格的整帧GPU版微图像视差匹配（多尺度 + 模糊分组/对齐）
 *********************************************************************/
-#ifndef ADAPTMIPMPFPGR_H
-#define ADAPTMIPMPFPGR_H
+#ifndef ADAPTMIPMFRAME_ACMM_H
+#define ADAPTMIPMFRAME_ACMM_H
 
-#include "AdaptMIPM.h"
+#include "MVStereo/LFDepthInfo.h"
+#include "Util/Logger.h"
 
 namespace LFMVS
 {
-    class AdaptMIPMPFPGR: public AdaptMIPM
+    const int MAX_ACMM_LEVELS = 4;
+
+    struct ACMMFrameLevelHostData
+    {
+        int width = 0;
+        int height = 0;
+        float scale = 1.0f;                 // 相对原始微图像尺度
+        std::vector<cv::Mat> images;        // CV_32FC1
+        std::vector<cv::Mat> blur_images;   // CV_32FC1
+        std::vector<float> blur_mean;       // 每个微图像的平均模糊值
+    };
+
+    class AdaptMIPMFrameACMM
     {
     public:
-        AdaptMIPMPFPGR(LightFieldParams& params);
-        ~AdaptMIPMPFPGR();
+        explicit AdaptMIPMFrameACMM(LightFieldParams& params);
+        ~AdaptMIPMFrameACMM();
 
-    public: // 接口
-        // 边缘像素感知的微图像密集匹配算法：补全 patch+propagation
-        void RunPatchMatchCUDAForMI_PFPGR_Collect();
+    public:
+        bool Initialize(QuadTreeTileInfoMap& MLA_info_map,
+                        QuadTreeProblemMap& problem_map);
+        void RunPatchMatchCUDAForFrameACMM();
+        void WriteBackResults(QuadTreeDisNormalMap& disNormals_map);
+        void ReleaseMemory();
 
-        void RunPatchMatchCUDAForMI_PFPGR_Repair();
+        int GetValidViewCount() const { return m_num_views; }
+        int GetNumLevels() const { return m_num_levels; }
 
-        void Initialize(QuadTreeTileInfoMap& MLA_info_map, MLA_Problem& problem,
-                    QuadTreeProblemMap& problem_map, std::vector<float4>& planeVec,
-                    std::vector<float>& costVec);
-        void Initialize_SecondStage(QuadTreeTileInfoMap& MLA_info_map, MLA_Problem& problem,
-                    QuadTreeProblemMap& problem_map, std::vector<float4>& planeVec,
-                    std::vector<float>& costVec,
-                    Proxy_DisPlane* proxy_Plane, StereoResultInfo* pStereoResult);
+    protected:
+        void InitGPUParamsFromCPUParams(int level_id);
+        bool BuildViewIndexMap(QuadTreeTileInfoMap& MLA_info_map, QuadTreeProblemMap& problem_map);
+        bool BuildBlurAlignedPyramids();
+        void BuildSingleLevelBlurAlignment(ACMMFrameLevelHostData& level_data) const;
+        bool InitializeGPUForLevel(int level_id);
+        void ReleaseGPUForCurrentLevel();
+        void CreateGrayImageObject(int image_index, const cv::Mat& image_in);
+        void CreateBlurImageObject(int image_index, const cv::Mat& blur_in);
+        void DownloadCurrentLevelResults();
+        void PrepareWarmStartFromPreviousLevel(int prev_level_id, int cur_level_id);
+        void UploadWarmStartToGPU();
 
-        int3 GetNeighborPGR(const int index);
+        float EstimateGaussianSigma(float blur_mean_src,
+                                    float blur_mean_target,
+                                    float level_scale) const;
 
-        void InitializeGPU_collect();
-        void InitializeGPU_new();
+    protected:
+        LightFieldParamsCUDA                m_ParamsCUDA;
+        PatchMatchParamsLF                  params;
 
-        // test
-        void TestWritePF_PGRInfo();
-        void TestWriteNeighbour();
-        void TestWriteNeighbour_color(MLA_Problem& problem, QuadTreeProblemMap& problem_map);
+        int                                 m_num_views;
+        int                                 m_max_neighbors;
+        int                                 m_pixels_per_view;
+        int                                 m_num_levels;
+        int                                 m_current_level;
+        bool                                m_bReleased;
 
-    private:
-        // 第一次GPU使用
-        int3*                    neighbor_PGR_host; // (邻域微图像id, 对应点像素坐标 x,y )
-        int3*                    neighbor_PGR_cuda; // (邻域微图像id, 对应点像素坐标 x,y )
+        float                               m_lambda_scale;
+        float                               m_lambda_geo;
+        float                               m_detail_th;
+        float                               m_geom_clip;
+        int                                 m_blur_group_count;
 
-        // 第二次GPU使用
-        Proxy_DisPlane*          proxy_plane_host; // (邻域微图像id, 对应点像素坐标 x,y )
-        Proxy_DisPlane*          proxy_plane_cuda; // (邻域微图像id, 对应点像素坐标 x,y )
+        std::vector<QuadTreeTileKeyPtr>     m_view_keys;
+        std::map<QuadTreeTileKeyPtr, int, QuadTreeTileKeyMapCmpLess> m_key_to_viewid;
+
+        std::vector<cv::Mat>                images_MI;
+        std::vector<cv::Mat>                blur_images_MI;
+
+        float2*                             centerPointS_MI;
+        int2*                               tileKeyS_MI;
+        int*                                neighbor_ids_host;
+        int*                                neighbor_counts_host;
+
+        std::vector<ACMMFrameLevelHostData> m_pyramid_levels;
+
+        cudaTextureObjects                  texture_objects_host;
+        cudaArray*                          cuArray[MAX_IMAGES];
+        cudaArray*                          cu_blur_Array[MAX_IMAGES];
+
+        cudaTextureObjects*                 texture_objects_cuda;
+        float2*                             centers_cuda;
+        int2*                               tilekeys_cuda;
+        int*                                neighbor_ids_cuda;
+        int*                                neighbor_counts_cuda;
+
+        float4*                             plane_prev_cuda;
+        float4*                             plane_next_cuda;
+        float*                              cost_prev_cuda;
+        float*                              cost_next_cuda;
+        float4*                             disp_prev_cuda;
+        float4*                             disp_next_cuda;
+        unsigned int*                       selected_prev_cuda;
+        unsigned int*                       selected_next_cuda;
+        curandState*                        rand_states_cuda;
+
+        float4*                             plane_init_cuda;
+        float*                              cost_init_cuda;
+        float4*                             disp_init_cuda;
+        unsigned int*                       selected_init_cuda;
+
+        std::vector<float4>                 plane_level_host;
+        std::vector<float>                  cost_level_host;
+        std::vector<float4>                 disp_level_host;
+        std::vector<unsigned int>           selected_level_host;
+
+        std::vector<float4>                 plane_init_host;
+        std::vector<float>                  cost_init_host;
+        std::vector<float4>                 disp_init_host;
+        std::vector<unsigned int>           selected_init_host;
+
+        float4*                             plane_final_host;
+        float*                              cost_final_host;
+        float4*                             disp_final_host;
+        unsigned int*                       selected_final_host;
     };
 }
-#endif //ADAPTMIPMPFPGR_H
+
+#endif // ADAPTMIPMFRAME_ACMM_H
