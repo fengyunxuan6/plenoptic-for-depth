@@ -2,7 +2,7 @@
 file base:      AdaptMIPMFrameACMM.cu
 author:         OpenAI + LZD workflow
 created:        2026/04/15
-purpose:        ACMM-v5：保留原LF有效内核，仅在初始化阶段支持多尺度暖启动
+purpose:        LF_ACMM-v6：原LF跨微图像内核 + ACMM式seed gate/detail restorer
 *********************************************************************/
 #include "AdaptMIPMFrameACMM.h"
 
@@ -162,18 +162,35 @@ namespace LFMVS
                                                 images[nvid], blur_images[nvid], centers[nvid], tilekeys[nvid],
                                                 p, plane_hypothesis, params, blur_v, disp_b);
             const float blur_weight = expf(-0.007368f * (blur_v.x - blur_v.y) * (blur_v.x - blur_v.y));
-            c = clamp_cost(c + 2.0f * (1.0f - blur_weight));
+            c = clamp_cost(c + 0.8f * (1.0f - blur_weight));
             cost_vector[k] = c;
             blur_vector[k] = blur_v;
             disp_vector[k] = disp_b;
         }
     }
 
-    // setBit 和 isSet 已在 CudaUtil.h/CudaUtil.cu 中定义，此处不需要重复定义
-    
+    static __device__ __forceinline__ void setBit(unsigned int &input, const unsigned int n)
+    {
+        input |= (unsigned int)1 << n;
+    }
+    static __device__ __forceinline__ int isSet(unsigned int input, const unsigned int n)
+    {
+        return (input >> n) & 1u;
+    }
     static __device__ __forceinline__ int CountBits32(unsigned int v)
     {
         return __popc(v);
+    }
+
+    static __device__ __forceinline__ bool WarmSeedIsValid_Frame(const float4 seed_plane,
+                                                                 const float seed_cost,
+                                                                 const unsigned int seed_sel,
+                                                                 const PatchMatchParamsLF params)
+    {
+        return (seed_plane.w >= params.disparity_min) &&
+               (seed_plane.w <= params.disparity_max) &&
+               (seed_cost < 1.0f) &&
+               (CountBits32(seed_sel) >= 3);
     }
 
     static __device__ unsigned int ComputeSelectedViewsTopK_Frame(
@@ -386,7 +403,7 @@ namespace LFMVS
         if (use_warm_start)
         {
             float4 warm_plane = plane_init[idx];
-            if (warm_plane.w >= params.disparity_min && warm_plane.w <= params.disparity_max)
+            if (WarmSeedIsValid_Frame(warm_plane, cost_init[idx], selected_init[idx], params))
             {
                 unsigned int sel_w = 0;
                 float cost_w = 2.0f;
@@ -449,14 +466,51 @@ namespace LFMVS
         disp_prev[idx] = best_disp;
         selected_prev[idx] = best_sel;
     }
+    static __device__ void DetailRestorer_FrameACMM(
+        const cudaTextureObjects* texture_objects, const float2* centers, const int2* tilekeys,
+        const int* neighbor_ids, const int* neighbor_counts, const int max_neighbors,
+        const PatchMatchParamsLF params, const int ref_vid, const int2 p,
+        const float4 seed_plane, const float seed_cost_prev, const unsigned int seed_sel_prev,
+        const bool use_warm_start, float4& best_plane, float& best_cost, float4& best_disp, unsigned int& best_sel)
+    {
+        if (!use_warm_start) return;
+        if (!WarmSeedIsValid_Frame(seed_plane, seed_cost_prev, seed_sel_prev, params)) return;
 
-    __global__ void CheckerboardUpdateFrameACMM(
+        unsigned int seed_sel = 0;
+        float seed_cost = 2.0f;
+        float4 seed_disp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        RecomputeSupportCostDisp_Frame(texture_objects, centers, tilekeys,
+                                       neighbor_ids, neighbor_counts, max_neighbors,
+                                       params, ref_vid, p, seed_plane,
+                                       seed_sel, seed_cost, seed_disp);
+
+        const int seed_count = CountBits32(seed_sel);
+        const int best_count = CountBits32(best_sel);
+        const float disp_gap = fabsf(best_plane.w - seed_plane.w);
+        const float large_gap = 0.08f * fmaxf(params.Base, 1e-3f);
+
+        const bool current_clearly_better = (best_cost + 0.10f < seed_cost) || (best_count >= seed_count + 2);
+        const bool current_ambiguous = (best_cost > seed_cost - 0.03f);
+        const bool current_maybe_carrier = (disp_gap > large_gap) && current_ambiguous && (best_count <= seed_count);
+
+        if ((!current_clearly_better && current_maybe_carrier) || (seed_cost + 0.02f < best_cost))
+        {
+            best_plane = seed_plane;
+            best_cost = seed_cost;
+            best_disp = seed_disp;
+            best_sel = seed_sel;
+        }
+    }
+
+
+    __global__ void CheckerboardUpdateFrame(
         cudaTextureObjects* texture_objects, float2* centers, int2* tilekeys,
         int* neighbor_ids, int* neighbor_counts, int max_neighbors,
         const float4* plane_prev, const float* cost_prev, const float4* disp_prev, const unsigned int* selected_prev,
+        const float4* plane_init, const float* cost_init, const unsigned int* selected_init,
         float4* plane_next, float* cost_next, float4* disp_next, unsigned int* selected_next,
         curandState* rand_states, const PatchMatchParamsLF params,
-        const int width, const int height, const int num_views, const int iter, const int phase)
+        const int width, const int height, const int num_views, const int iter, const int phase, const bool use_warm_start)
     {
         const int x = blockIdx.x * blockDim.x + threadIdx.x;
         const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -823,7 +877,14 @@ namespace LFMVS
                                         params, vid, p, &rand_states[idx], view_weights,
                                         best_plane, best_cost, best_disp);
 
-        // v5.1：
+        DetailRestorer_FrameACMM(texture_objects, centers, tilekeys,
+                                 neighbor_ids, neighbor_counts, max_neighbors,
+                                 params, vid, p,
+                                 plane_init[idx], cost_init[idx], selected_init[idx],
+                                 use_warm_start,
+                                 best_plane, best_cost, best_disp, best_sel);
+
+        // v6：
         // 传播/采样阶段用的是一套“临时视图权重”来比较候选，但写回阶段必须让
         // plane / cost / selected_views / disp_v 对同一个最终 plane 重新对齐。
         // 否则不过滤时能看到弱结构，而一过滤就会因 metadata 不一致被大量清空。
@@ -892,24 +953,26 @@ namespace LFMVS
 
         for (int iter = 0; iter < params.max_iterations; ++iter)
         {
-            CheckerboardUpdateFrameACMM<<<grid_size, block_size>>>(
+            CheckerboardUpdateFrame<<<grid_size, block_size>>>(
                 texture_objects_cuda, centers_cuda, tilekeys_cuda,
                 neighbor_ids_cuda, neighbor_counts_cuda, max_neighbors,
                 plane_prev_cuda, cost_prev_cuda, disp_prev_cuda, selected_prev_cuda,
+                plane_init_cuda, cost_init_cuda, selected_init_cuda,
                 plane_next_cuda, cost_next_cuda, disp_next_cuda, selected_next_cuda,
-                rand_states_cuda, params, width, height, num_views, iter, 0);
+                rand_states_cuda, params, width, height, num_views, iter, 0, use_warm_start);
             CUDA_SAFE_CALL(cudaDeviceSynchronize());
             std::swap(plane_prev_cuda, plane_next_cuda);
             std::swap(cost_prev_cuda, cost_next_cuda);
             std::swap(disp_prev_cuda, disp_next_cuda);
             std::swap(selected_prev_cuda, selected_next_cuda);
 
-            CheckerboardUpdateFrameACMM<<<grid_size, block_size>>>(
+            CheckerboardUpdateFrame<<<grid_size, block_size>>>(
                 texture_objects_cuda, centers_cuda, tilekeys_cuda,
                 neighbor_ids_cuda, neighbor_counts_cuda, max_neighbors,
                 plane_prev_cuda, cost_prev_cuda, disp_prev_cuda, selected_prev_cuda,
+                plane_init_cuda, cost_init_cuda, selected_init_cuda,
                 plane_next_cuda, cost_next_cuda, disp_next_cuda, selected_next_cuda,
-                rand_states_cuda, params, width, height, num_views, iter, 1);
+                rand_states_cuda, params, width, height, num_views, iter, 1, use_warm_start);
             CUDA_SAFE_CALL(cudaDeviceSynchronize());
             std::swap(plane_prev_cuda, plane_next_cuda);
             std::swap(cost_prev_cuda, cost_next_cuda);
