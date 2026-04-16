@@ -2,7 +2,7 @@
 file base:      AdaptMIPMFrameACMM.cpp
 author:         OpenAI + LZD workflow
 created:        2026/04/15
-purpose:        ACMM风格整帧微图像匹配（v5：保留原LF有效内核，仅增加多尺度/暖启动）
+purpose:        LF_ACMM-v6：原LF跨微图像内核 + ACMM式弱多尺度先验/seed gate/detail restorer
 *********************************************************************/
 #include "AdaptMIPMFrameACMM.h"
 
@@ -156,21 +156,29 @@ namespace LFMVS
     {
         const ACMMFrameLevelHostData& level = m_pyramid_levels[level_id];
 
-        // v5.2：
-        // 不再把多尺度做得太深，也不让粗层跑太久。
-        // 目标是：粗层只提供“弱先验”，细层仍由原LF内核主导精细恢复。
+        // v6：
+        // 原LF内核继续主导精细恢复；多尺度只作为弱先验。
+        // 粗层更稳（大patch、少迭代），细层更细（小patch、足够迭代）。
         if (m_num_levels <= 1)
+        {
             params.max_iterations = 5;
+            params.patch_size = 5;
+        }
         else if (level_id == 0)
-            params.max_iterations = 2;   // 最粗层：只做弱初始化
+        {
+            params.max_iterations = 3;
+            params.patch_size = 7;
+        }
         else
-            params.max_iterations = 6;   // 最细层：让原LF refinement 充分收敛
+        {
+            params.max_iterations = 6;
+            params.patch_size = 5;
+        }
 
-        params.patch_size = 5;
-        params.patch_Bound_size = 5;
+        params.patch_Bound_size = params.patch_size;
         params.propagation_Graph_size = 5;
         params.num_images = m_max_neighbors + 1;
-        params.top_k = 5;
+        params.top_k = (level_id == 0) ? 6 : 5;
 
         // 与原有有效LF内核保持同量纲；每层只按当前Base同步缩放
         params.Base = m_ParamsCUDA.baseline * level.scale;
@@ -185,10 +193,11 @@ namespace LFMVS
         params.base_height_sigma = 0.05f;
         params.geom_consistency = false;
 
-        LOG_INFO("ACMM-v5.2 params: level=", level_id,
+        LOG_INFO("LF_ACMM-v6 params: level=", level_id,
                  ", width=", level.width,
                  ", height=", level.height,
                  ", Base=", params.Base,
+                 ", patch_size=", params.patch_size,
                  ", max_iterations=", params.max_iterations,
                  ", num_images=", params.num_images,
                  ", top_k=", params.top_k,
@@ -490,9 +499,9 @@ namespace LFMVS
         const int prev_pixels = prev_level.width * prev_level.height;
         const int cur_pixels = cur_level.width * cur_level.height;
 
-        plane_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 1, 0.0f));
+        plane_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 1, -1.0f));
         cost_init_host.assign(cur_pixels * m_num_views, 2.0f);
-        disp_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 0, 0.0f));
+        disp_init_host.assign(cur_pixels * m_num_views, make_float4(0, 0, 0, -1.0f));
         selected_init_host.assign(cur_pixels * m_num_views, 0);
 
         if ((int)plane_level_host.size() != prev_pixels * m_num_views)
@@ -501,6 +510,8 @@ namespace LFMVS
         const float sx = (float)prev_level.width / std::max(1, cur_level.width);
         const float sy = (float)prev_level.height / std::max(1, cur_level.height);
         const float disp_scale = cur_level.scale / std::max(prev_level.scale, 1e-6f);
+        const float prev_base = m_ParamsCUDA.baseline * prev_level.scale;
+        const float stddev_thresh = std::max(0.03f, 0.12f * prev_base);
 
         for (int vid = 0; vid < m_num_views; ++vid)
         {
@@ -513,15 +524,44 @@ namespace LFMVS
                     const int prev_idx = vid * prev_pixels + py * prev_level.width + px;
                     const int cur_idx = vid * cur_pixels + y * cur_level.width + x;
 
+                    const float prev_cost = cost_level_host[prev_idx];
+                    const unsigned int prev_sel = selected_level_host[prev_idx];
+                    const int prev_sel_count = __builtin_popcount(prev_sel);
+
+                    float mean = 0.0f, sq = 0.0f;
+                    int n = 0;
+                    for (int oy = -1; oy <= 1; ++oy)
+                    {
+                        const int yy = std::min(prev_level.height - 1, std::max(0, py + oy));
+                        for (int ox = -1; ox <= 1; ++ox)
+                        {
+                            const int xx = std::min(prev_level.width - 1, std::max(0, px + ox));
+                            const int nb_idx = vid * prev_pixels + yy * prev_level.width + xx;
+                            const float d = plane_level_host[nb_idx].w;
+                            mean += d;
+                            sq += d * d;
+                            ++n;
+                        }
+                    }
+                    mean /= std::max(1, n);
+                    const float var = std::max(0.0f, sq / std::max(1, n) - mean * mean);
+                    const float stddev = std::sqrt(var);
+
+                    // seed gate：只有高置信、局部连续的粗层结果才传给细层；
+                    // 否则细层重新随机初始化，避免把微图像载波纹理成片带下来。
+                    const bool reliable_seed = (prev_cost < 1.0f) &&
+                                               (prev_sel_count >= 3) &&
+                                               (stddev <= stddev_thresh);
+
+                    if (!reliable_seed)
+                        continue;
+
                     float4 prev_plane = plane_level_host[prev_idx];
-                    // 保留原plane方向，只同步anchor disparity量纲
                     prev_plane.w *= disp_scale;
                     plane_init_host[cur_idx] = prev_plane;
-
-                    // 元信息在当前层必须重算，这里不再直接搬旧层 cost/selected/disp
-                    cost_init_host[cur_idx] = 2.0f;
-                    disp_init_host[cur_idx] = make_float4(0, 0, 0, 0.0f);
-                    selected_init_host[cur_idx] = 0;
+                    cost_init_host[cur_idx] = prev_cost;
+                    disp_init_host[cur_idx] = make_float4(0, 0, 0, prev_plane.w);
+                    selected_init_host[cur_idx] = prev_sel;
                 }
             }
         }
@@ -608,7 +648,7 @@ namespace LFMVS
                 if (c < 1.8f) ++good_cost;
             }
             const double denom = std::max<size_t>(1, cost_level_host.size());
-            LOG_INFO("ACMM-v5 level=", lid,
+            LOG_INFO("LF_ACMM-v6 level=", lid,
                      ", scale=", m_pyramid_levels[lid].scale,
                      ", valid_selected_ratio=", (double)valid_selected / denom,
                      ", good_cost_ratio=", (double)good_cost / denom,
