@@ -123,6 +123,9 @@ cuda_add_executable(
         MIStereo/AdaptMIPMPFPGRUtil.cuh
 
         # ===== 新增：ACMM 风格多尺度整帧微图像匹配内核 =====
+        MIStereo/AdaptMIPMFrame.h
+        # 注意: AdaptMIPMFrame.cpp 被 MIStereoMatch.cpp include,不需要单独编译
+        # 注意: AdaptMIPMFrame.cu 被 CudaUtil.cu include,不需要单独编译
         MIStereo/AdaptMIPMFrameACMM.h
         MIStereo/AdaptMIPMFrameACMM.cpp
         MIStereo/AdaptMIPMFrameACMM.cu
