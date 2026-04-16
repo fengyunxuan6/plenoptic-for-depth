@@ -1428,27 +1428,25 @@ namespace LFMVS
 
         m_VirtualDepthMap = cv::Mat::zeros(image_height, image_width, CV_32F);
         m_AIF_Color = cv::Mat::zeros(image_height, image_width, CV_8UC3);
-        // 深度稳定性评分置信图
         cv::Mat VD_Confidence = cv::Mat::zeros(image_height, image_width, CV_8UC1);
 
         QuadTreeDisNormalMapMap& disNormalMapMap = m_ptrDepthSolver->GetMLADisNormalMapMap();
         QuadTreeDisNormalMapMap::iterator itrDis = disNormalMapMap.find(strFrameName);
         if (itrDis == disNormalMapMap.end())
         {
-            LOG_ERROR("Current disNormalMapMap not found: " , strFrameName.c_str());
+            LOG_ERROR("Current disNormalMapMap not found: ", strFrameName.c_str());
             return;
         }
         QuadTreeDisNormalMap& disNormals_map = itrDis->second;
 
         // Step1: 为每个有效估计视差的微图像建立一个mask图
         QuadTreeImageMap masks;
-        for(QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); ++itr)
+        for (QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); ++itr)
         {
             MLA_Problem& problem = itr->second;
-            if (problem.m_bGarbage /*|| problem.m_bNeedMatch==false*/)
-            {
+            if (problem.m_bGarbage)
                 continue;
-            }
+
             QuadTreeTileKeyPtr ptrKey = itr->first;
 
             QuadTreeTileInfoMap::iterator itrInfo = mla_info_map.find(ptrKey);
@@ -1457,28 +1455,30 @@ namespace LFMVS
                 LOG_ERROR("Current MLA_info not found: ", ptrKey->StrRemoveLOD().c_str());
                 continue;
             }
-            QuadTreeDisNormalMap& disNormals_map = itrDis->second;
+
             QuadTreeDisNormalMap::iterator itr_DN = disNormals_map.find(ptrKey);
             if (itr_DN == disNormals_map.end())
             {
                 LOG_ERROR("Current disNormal not found: ", ptrKey->StrRemoveLOD().c_str());
                 continue;
             }
+
             int mi_rows = problem.m_Image_gray.rows;
             int mi_cols = problem.m_Image_gray.cols;
-            cv::Mat mask = cv::Mat::zeros(mi_rows, mi_cols, CV_8UC1);
-            masks[ptrKey] = mask;
+            masks[ptrKey] = cv::Mat::zeros(mi_rows, mi_cols, CV_8UC1);
         }
 
-        // step2: 开始融合
+        // Step2: 融合虚拟深度
         std::vector<PointList> PointCloud;
-        for(QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); ++itr)
+        PointCloud.reserve(image_width * image_height / 8);
+
+        for (QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); ++itr)
         {
             MLA_Problem& problem = itr->second;
-            if (problem.m_bGarbage /*|| problem.m_bNeedMatch==false*/)
+            if (problem.m_bGarbage)
                 continue;
+
             QuadTreeTileKeyPtr ptrKey = itr->first;
-            //LOG_ERROR("Fuse virtual_depth, key: ", ptrKey->StrRemoveLOD().c_str());
 
             QuadTreeTileInfoMap::iterator itrInfo = mla_info_map.find(ptrKey);
             if (itrInfo == mla_info_map.end())
@@ -1489,48 +1489,52 @@ namespace LFMVS
             if (itr_DN == disNormals_map.end())
                 continue;
             DisparityAndNormalPtr ptrDN = itr_DN->second;
+
             cv::Point2f center_at_mla = mla_InfoPtr->GetCenter();
 
-            // 开始处理
-            int num_ngb = problem.m_NeighsSortVecForMatch.size();
+            int num_ngb = static_cast<int>(problem.m_NeighsSortVecForMatch.size());
             std::vector<int2> used_list(num_ngb, make_int2(-1, -1));
 
             int mi_rows = problem.m_Image_gray.rows;
             int mi_cols = problem.m_Image_gray.cols;
-            cv::Vec2f center_mi((mi_cols-1)*0.5f+1.0, (mi_rows-1)*0.5f+1.0);
-            for(int r = 0; r < mi_rows; r++)
+            cv::Vec2f center_mi((mi_cols - 1) * 0.5f + 1.0f, (mi_rows - 1) * 0.5f + 1.0f);
+
+            for (int r = 0; r < mi_rows; ++r)
             {
-                for (int c = 0; c < mi_cols; c++)
+                for (int c = 0; c < mi_cols; ++c)
                 {
                     cv::Mat& mask = masks[ptrKey];
                     if (mask.at<uchar>(r, c) == 1)
                         continue;
+
                     int index = r * mi_cols + c;
                     float disp_ref = ptrDN->d_cuda[index];
 
-                    // TODO: 临时
-                    if (disp_ref < 1.0)
+                    // 保持与现有流程一致：仅融合有效视差
+                    if (disp_ref < 1.0f)
                         continue;
 
                     float4 normal_ref_tmp = ptrDN->ph_cuda[index];
-                    cv::Vec3f normal_ref = cv::Vec3f(normal_ref_tmp.x, normal_ref_tmp.y, normal_ref_tmp.z);
-                    cv::Vec3f consistent_normal = normal_ref;
+                    cv::Vec3f consistent_normal(normal_ref_tmp.x, normal_ref_tmp.y, normal_ref_tmp.z);
 
-                    // 计算虚像点
                     float virtualDepth_ref = ComputeVirtualDepth(disp_ref, params);
-                    if (fabs(virtualDepth_ref-g_Invalid_image) < 1.0e-6)
-                    {
+                    if (fabs(virtualDepth_ref - g_Invalid_image) < 1.0e-6f)
                         continue;
-                    }
-                    cv::Vec3f virtualPoint3D_ref = ComputeVirtual3D(virtualDepth_ref, c, r, mi_cols, mi_rows, center_at_mla);
-                    cv::Vec3f consistent_Point = virtualPoint3D_ref;
-                    uchar consistent_Color[3] = {problem.m_Image_rgb.at<uchar3>(r, c).x,
-                        problem.m_Image_rgb.at<uchar3>(r, c).y,
-                        problem.m_Image_rgb.at<uchar3>(r, c).z};
 
-                    // 遍历邻居
+                    cv::Vec3f virtualPoint3D_ref =
+                        ComputeVirtual3D(virtualDepth_ref, c, r, mi_cols, mi_rows, center_at_mla);
+                    cv::Vec3f consistent_Point = virtualPoint3D_ref;
+
+                    // 注意：这里必须用 float 累加，不能继续用 uchar，避免跨邻居累加时溢出
+                    cv::Vec3f consistent_Color(
+                        static_cast<float>(problem.m_Image_rgb.at<uchar3>(r, c).x),
+                        static_cast<float>(problem.m_Image_rgb.at<uchar3>(r, c).y),
+                        static_cast<float>(problem.m_Image_rgb.at<uchar3>(r, c).z));
+
+                    std::fill(used_list.begin(), used_list.end(), make_int2(-1, -1));
+
                     int num_consistent = 0;
-                    for (int j = 0; j < num_ngb; j++)
+                    for (int j = 0; j < num_ngb; ++j)
                     {
                         QuadTreeTileKeyPtr ptrKey_src = problem.m_NeighsSortVecForMatch[j];
 
@@ -1543,89 +1547,89 @@ namespace LFMVS
                         if (itr_DN_src == disNormals_map.end())
                             continue;
                         DisparityAndNormalPtr ptrDN_src = itr_DN_src->second;
+
                         QuadTreeTileInfoMap::iterator itrInfo_src = mla_info_map.find(ptrKey_src);
                         if (itrInfo_src == mla_info_map.end())
                             continue;
                         MLA_InfoPtr ptrInfo_src = itrInfo_src->second;
 
                         cv::Point2f center_src_at_mla = ptrInfo_src->GetCenter();
-                        cv::Vec2f center_mi_src((mi_cols-1)*0.5f+1, (mi_rows-1)*0.5f+1);
+                        cv::Vec2f center_mi_src((mi_cols - 1) * 0.5f + 1.0f, (mi_rows - 1) * 0.5f + 1.0f);
 
-                        // 反投影
                         cv::Vec2f coord_src_mi = BackProject2MI(virtualPoint3D_ref, center_src_at_mla, center_mi_src);
-                        int src_r = int(coord_src_mi[1] + 0.5f);
-                        int src_c = int(coord_src_mi[0] + 0.5f);
-                        if (src_c >= 0 && src_c < mi_cols && src_r >= 0 && src_r < mi_rows)
+                        int src_r = static_cast<int>(coord_src_mi[1] + 0.5f);
+                        int src_c = static_cast<int>(coord_src_mi[0] + 0.5f);
+
+                        if (src_c < 0 || src_c >= mi_cols || src_r < 0 || src_r >= mi_rows)
+                            continue;
+
+                        if (masks[ptrKey_src].at<uchar>(src_r, src_c) == 1)
+                            continue;
+
+                        int index_src = src_r * mi_cols + src_c;
+
+                        float disp_src = ptrDN_src->d_cuda[index_src];
+                        float virtualDepth_src = ComputeVirtualDepth(disp_src, params);
+                        if (fabs(virtualDepth_src - g_Invalid_image) < 1.0e-6f)
+                            continue;
+
+                        float4 normal_src_tmp = ptrDN_src->ph_cuda[index_src];
+                        cv::Vec3f normal_src(normal_src_tmp.x, normal_src_tmp.y, normal_src_tmp.z);
+
+                        cv::Vec3f virtual_Point_src =
+                            ComputeVirtual3D(virtualDepth_src, src_c, src_r, mi_cols, mi_rows, center_src_at_mla);
+
+                        cv::Vec2f coord_mi_reproject = BackProject2MI(virtual_Point_src, center_at_mla, center_mi);
+                        float reproj_error =
+                            std::sqrt((c - coord_mi_reproject[0]) * (c - coord_mi_reproject[0]) +
+                                      (r - coord_mi_reproject[1]) * (r - coord_mi_reproject[1]));
+                        float relative_virtualDepth_diff =
+                            std::fabs(virtualDepth_src - virtualDepth_ref) / std::max(virtualDepth_ref, 1.0e-6f);
+
+                        if (reproj_error < 1.0f && relative_virtualDepth_diff < 0.05f)
                         {
-                            if (masks[ptrKey_src].at<uchar>(src_r, src_c) == 1)
-                                continue;
+                            consistent_Point += virtual_Point_src;
+                            consistent_normal += normal_src;
+                            cv::Vec3b src_color = problem_src.m_Image_rgb.at<cv::Vec3b>(src_r, src_c);
+                            consistent_Color += cv::Vec3f(
+                                static_cast<float>(src_color[0]),
+                                static_cast<float>(src_color[1]),
+                                static_cast<float>(src_color[2]));
 
-                            int index_src = src_r * mi_cols + src_c;
-                            float4 normal_src_tmp = ptrDN_src->ph_cuda[index_src];
-                            cv::Vec3f normal_src = cv::Vec3f(normal_src_tmp.x, normal_src_tmp.y, normal_src_tmp.z);
-
-                            float disp_src = ptrDN_src->d_cuda[index_src];
-                            float virtualDepth_src = ComputeVirtualDepth(disp_src, params);
-                            if (fabs(virtualDepth_src -g_Invalid_image)<1e-6)
-                            {
-                                continue;
-                            }
-                            cv::Vec3f virtual_Point_src = ComputeVirtual3D(virtualDepth_src, src_c,
-                                src_r, mi_cols, mi_rows, center_src_at_mla);
-
-                            // 反投影到参考微图像
-                            cv::Vec2f coord_mi_reproject = BackProject2MI(virtual_Point_src, center_at_mla, center_mi);
-                            float reproj_error = sqrt(pow(c - coord_mi_reproject[0], 2) + pow(r - coord_mi_reproject[1], 2));
-                            float relative_virtualDepth_diff = fabs(virtualDepth_src - virtualDepth_ref) / virtualDepth_ref;
-                            if (reproj_error < 1.0f && relative_virtualDepth_diff < 0.05f)
-                            {
-                                consistent_Point[0] += virtual_Point_src[0];
-                                consistent_Point[1] += virtual_Point_src[1];
-                                consistent_Point[2] += virtual_Point_src[2];
-                                consistent_normal += normal_src;
-
-                                consistent_Color[0] += problem_src.m_Image_rgb.at<cv::Vec3b>(src_r, src_c)[0];
-                                consistent_Color[1] += problem_src.m_Image_rgb.at<cv::Vec3b>(src_r, src_c)[1];
-                                consistent_Color[2] += problem_src.m_Image_rgb.at<cv::Vec3b>(src_r, src_c)[2];
-
-                                used_list[j].x = src_c;
-                                used_list[j].y = src_r;
-                                num_consistent++;
-                            }
+                            used_list[j].x = src_c;
+                            used_list[j].y = src_r;
+                            ++num_consistent;
                         }
                     }
 
-                    // 注：TODO LZD 深度信息的评估置信图
                     if (num_consistent >= 2)
                     {
-                        consistent_Point[0] /= (num_consistent + 1.0f);
-                        consistent_Point[1] /= (num_consistent + 1.0f);
-                        consistent_Point[2] /= (num_consistent + 1.0f);
-                        consistent_normal /= (num_consistent + 1.0f);
-                        consistent_Color[0] /= (num_consistent + 1.0f);
-                        consistent_Color[1] /= (num_consistent + 1.0f);
-                        consistent_Color[2] /= (num_consistent + 1.0f);
+                        const float denom = num_consistent + 1.0f;
+                        consistent_Point /= denom;
+                        consistent_normal /= denom;
+                        consistent_Color /= denom;
 
                         PointList point3D;
                         point3D.coord = make_float3(consistent_Point[0], consistent_Point[1], consistent_Point[2]);
                         point3D.normal = make_float3(consistent_normal[0], consistent_normal[1], consistent_normal[2]);
                         point3D.color = make_float3(consistent_Color[0], consistent_Color[1], consistent_Color[2]);
 
-                        if (point3D.coord.y >= 0 && point3D.coord.y < image_height
-                            && point3D.coord.x >= 0 && point3D.coord.x < image_width)
+                        const int vy = static_cast<int>(point3D.coord.y);
+                        const int vx = static_cast<int>(point3D.coord.x);
+
+                        if (vy >= 0 && vy < image_height && vx >= 0 && vx < image_width)
                         {
-                            VD_Confidence.at<uchar>
-                            (static_cast<int>(point3D.coord.y),
-                            static_cast<int>(point3D.coord.x)) = static_cast<uchar>(std::min(255, num_consistent * 100)); // num_consistent
-                            m_VirtualDepthMap.at<float>(static_cast<int>(point3D.coord.y),
-                                        static_cast<int>(point3D.coord.x)) = point3D.coord.z;
+                            m_VirtualDepthMap.at<float>(vy, vx) = point3D.coord.z;
                             PointCloud.push_back(point3D);
 
-                            m_AIF_Color.at<cv::Vec3b>(static_cast<int>(point3D.coord.y),
-                                        static_cast<int>(point3D.coord.x)) =
-                                            cv::Vec3b(problem.m_Image_rgb.at<uchar3>(r, c).x,
-                                                problem.m_Image_rgb.at<uchar3>(r, c).y,
-                                                problem.m_Image_rgb.at<uchar3>(r, c).z);
+                            // 置信度：按支持视图数做一个简单编码
+                            VD_Confidence.at<uchar>(vy, vx) =
+                                static_cast<uchar>(std::min(255, num_consistent * 80));
+
+                            m_AIF_Color.at<cv::Vec3b>(vy, vx) = cv::Vec3b(
+                                cv::saturate_cast<uchar>(consistent_Color[0]),
+                                cv::saturate_cast<uchar>(consistent_Color[1]),
+                                cv::saturate_cast<uchar>(consistent_Color[2]));
                         }
 
                         for (int j = 0; j < num_ngb; ++j)
@@ -1640,129 +1644,148 @@ namespace LFMVS
             }
         }
 
-        // 保存结果
+        // Step3: 保存基础结果
         m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
             {
                 if (!boost::filesystem::create_directory(dir_save_path))
-                {
                     std::cout << "dir failed to create: " << m_strSavePath << std::endl;
-                }
             }
         }
+
         std::string strVDImagePath = m_strSavePath + "/" + LF_VIRTUALDEPTHMAP_NAME + std::string(".tiff");
         cv::imwrite(strVDImagePath, m_VirtualDepthMap);
+
         std::string strAIFImagePath = m_strSavePath + LF_ALLINFOUCSIMAGE_NAME + std::string(".png");
         cv::imwrite(strAIFImagePath, m_AIF_Color);
 
-        std::string strVD_Gray_Path = m_strSavePath + std::string("/VD_Raw.tiff");
-        cv::imwrite(strVD_Gray_Path, m_VirtualDepthMap);
+        // 原始 float 虚拟深度图（调试/定量使用）
+        std::string strVDRawFloatPath = m_strSavePath + std::string("/VD_Raw_float.tiff");
+        cv::imwrite(strVDRawFloatPath, m_VirtualDepthMap);
 
-        // 全聚焦图像的填充
-        //FillVirtualDepthMap();
+        // Step4: 统计有效虚拟深度范围（只统计有效像素）
+        std::vector<float> vd_data_valid;
+        vd_data_valid.reserve(image_height * image_width / 8);
 
-        // 统计
-        std::vector<float> vd_data_mla;
-        for (int row=0; row < image_height; row++)
+        for (int row = 0; row < image_height; ++row)
         {
-            for (int col=0; col < image_width; col++)
+            const float* ptr = m_VirtualDepthMap.ptr<float>(row);
+            for (int col = 0; col < image_width; ++col)
             {
-                float vd = m_VirtualDepthMap.at<float>(row, col);
-                vd_data_mla.push_back(vd);
+                float vd = ptr[col];
+                if (std::isfinite(vd) && vd > 0.0f)
+                    vd_data_valid.push_back(vd);
             }
         }
-        std::vector<float> vd_inlier_global;
+
         float lo_global = 0.0f, hi_global = 0.0f;
-        m_ptrDepthSolver->BuildGlobalDispInlierMAD(vd_data_mla, vd_inlier_global,
-            lo_global, hi_global, 3.0f, 0.02f);
-        LOG_ERROR("LF-Refocus-backproject: min_vd= ", lo_global, "max_vd= ", hi_global);
-//        for (int row=0; row < image_height; row++)
-//        {
-//            for (int col=0; col < image_width; col++)
-//            {
-//                if (m_VirtualDepthMap.at<float>(row, col) < lo_global)
-//                {
-//                    m_VirtualDepthMap.at<float>(row, col) = lo_global;
-//                }
-//                else if (m_VirtualDepthMap.at<float>(row, col) > hi_global)
-//                {
-//                    m_VirtualDepthMap.at<float>(row, col)= hi_global;
-//                    VD_Confidence.at<uchar>(row, col) = 255;  // 设置置信度为最大值
-//                }
-//            }
-//        }
+        std::vector<float> vd_inlier_global;
+        if (!vd_data_valid.empty())
+        {
+            m_ptrDepthSolver->BuildGlobalDispInlierMAD(
+                vd_data_valid, vd_inlier_global, lo_global, hi_global, 3.0f, 0.02f);
+            LOG_ERROR("LF-Refocus-backproject: min_vd= ", lo_global, " max_vd= ", hi_global);
+        }
+        else
+        {
+            LOG_ERROR("LF-Refocus-backproject: no valid virtual depth points.");
+            lo_global = 0.0f;
+            hi_global = 1.0f;
+        }
 
+        // Step5: 生成灰度图和伪彩色图
+        // 核心修正：
+        // 1) 不再把 m_VirtualDepthMap 直接覆盖成颜色图；
+        // 2) 只对有效像素做归一化；
+        // 3) 无效背景单独设为黑色，避免 JET 把 0 映射成整片蓝色。
+        cv::Mat VD_Raw = m_VirtualDepthMap.clone();
+        cv::Mat validMask = (VD_Raw > 0.0f);
 
+        double minV = 0.0, maxV = 0.0;
+        cv::minMaxLoc(VD_Raw, &minV, &maxV, nullptr, nullptr, validMask);
 
-        // 虚拟深度图 - 使用增强对比度的颜色映射
-        cv::normalize(m_VirtualDepthMap, m_VirtualDepthMap, 0, 255, cv::NORM_MINMAX);
-        
-        // 应用伽马校正增强对比度
-        cv::Mat enhanced_depth;
-        cv::Mat VD_Gray;
-        m_VirtualDepthMap.convertTo(enhanced_depth, CV_32F);
-        
-        // 伽马校正参数
-        double gamma = 0.7; // 降低gamma值以增强对比度
-        cv::pow(enhanced_depth/255.0, gamma, enhanced_depth);
-        
-        // 转换回8位并应用颜色映射
-        enhanced_depth.convertTo(VD_Gray, CV_8UC1, 255.0);
-        cv::applyColorMap(VD_Gray, m_VirtualDepthMap, cv::COLORMAP_JET);
+        float lo_vis = std::max(static_cast<float>(minV), lo_global);
+        float hi_vis = std::min(static_cast<float>(maxV), hi_global);
 
-        // 确保输出图像的数据类型正确
+        if (!(hi_vis > lo_vis + 1.0e-6f))
+        {
+            lo_vis = static_cast<float>(minV);
+            hi_vis = static_cast<float>(maxV);
+            if (!(hi_vis > lo_vis + 1.0e-6f))
+                hi_vis = lo_vis + 1.0f;
+        }
+
+        cv::Mat VD_Gray = cv::Mat::zeros(image_height, image_width, CV_8UC1);
+        const float gamma = 0.8f; // 轻度增强对比度，避免有效点都挤在同一小色带
+
+        for (int row = 0; row < image_height; ++row)
+        {
+            const float* src_ptr = VD_Raw.ptr<float>(row);
+            const uchar* mask_ptr = validMask.ptr<uchar>(row);
+            uchar* gray_ptr = VD_Gray.ptr<uchar>(row);
+
+            for (int col = 0; col < image_width; ++col)
+            {
+                if (!mask_ptr[col])
+                    continue;
+
+                float v = src_ptr[col];
+                v = std::min(std::max(v, lo_vis), hi_vis);
+                float norm_v = (v - lo_vis) / (hi_vis - lo_vis);
+                norm_v = std::pow(norm_v, gamma);
+                gray_ptr[col] = cv::saturate_cast<uchar>(norm_v * 255.0f);
+            }
+        }
+
+        std::string strVDGrayPath = m_strSavePath + std::string("/VD_Raw_gray.png");
+        cv::imwrite(strVDGrayPath, VD_Gray);
+
         cv::Mat VD_Color_Output;
-        m_VirtualDepthMap.convertTo(VD_Color_Output, CV_8UC3);
+        cv::applyColorMap(VD_Gray, VD_Color_Output, cv::COLORMAP_JET);
 
-//        std::string strVD_Gray_Path = m_strSavePath + std::string("/VD_Raw.tiff");
-//        cv::imwrite(strVD_Gray_Path, VD_Gray);
-        std::string strVD_Color_Path = m_strSavePath + std::string("/VD_Raw_color.png");
-        cv::imwrite(strVD_Color_Path, VD_Color_Output);
+        // 无效背景统一设为黑色；若你想保留其他背景色，可在这里修改
+        VD_Color_Output.setTo(cv::Scalar(0, 0, 0), ~validMask);
 
-        // 置信图
-        std::string strVDConfPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTH_CONFMAP_RAW_NAME + std::string(".png");
+        std::string strVDColorPath = m_strSavePath + std::string("/VD_Raw_color.png");
+        cv::imwrite(strVDColorPath, VD_Color_Output);
+
+        // Step6: 置信图
+        std::string strVDConfPath = m_strSavePath + strFrameName + "_" +
+            LF_VIRTUALDEPTH_CONFMAP_RAW_NAME + std::string(".png");
         cv::imwrite(strVDConfPath, VD_Confidence);
-        // 二值化处理，生成黑白图
+
         cv::Mat VD_Confidence_Binary;
         cv::threshold(VD_Confidence, VD_Confidence_Binary, 50, 255, cv::THRESH_BINARY);
-        // 使用形态学操作平滑边界
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT,
-            cv::Size(3, 3));
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
         cv::morphologyEx(VD_Confidence_Binary, VD_Confidence_Binary, cv::MORPH_CLOSE, kernel);
-        std::string strVDConfBinaryPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTH_CONFMAP_NAME + ".png";
-        cv::imwrite(strVDConfBinaryPath, VD_Confidence_Binary);
-        //std::string ply_path = m_strSavePath + "/vitrual_3dmodel.ply";
-        //StoreColorPlyFileBinaryPointCloud (ply_path, PointCloud);
 
-        // 配置并一键执行
-//        if (g_Debug_Static >= 1)
-        bool bAnalyse = true;
-        if (bAnalyse)
+        std::string strVDConfBinaryPath = m_strSavePath + strFrameName + "_" +
+            LF_VIRTUALDEPTH_CONFMAP_NAME + ".png";
+        cv::imwrite(strVDConfBinaryPath, VD_Confidence_Binary);
+
+        // Step7: 分布分析
+        bool bAnalyse = false;
+        if (bAnalyse && !PointCloud.empty())
         {
             std::vector<float> data;
             data.reserve(PointCloud.size());
-            for (int i=0; i<PointCloud.size(); i++)
-            {
-                float3& point = PointCloud.at(i).coord;
-                data.push_back(point.z);
-            }
+            for (size_t i = 0; i < PointCloud.size(); ++i)
+                data.push_back(PointCloud[i].coord.z);
 
-            bool exact=false;
-            double hdi_p=0.85;
-            int imgW=1400;
-            int imgH=480;
-            bool show=false;
+            bool exact = false;
+            double hdi_p = 0.85;
+            int imgW = 1400;
+            int imgH = 480;
+            bool show = false;
 
             std::string prefix = m_strSavePath + std::string("/Distribution_analysis");
             boost::filesystem::path dir_save_path(prefix);
             if (!boost::filesystem::exists(dir_save_path))
             {
                 if (!boost::filesystem::create_directory(dir_save_path))
-                {
                     std::cout << "dir failed to create: " << prefix << std::endl;
-                }
             }
             prefix += "/analysis";
 
@@ -1777,35 +1800,35 @@ namespace LFMVS
 
             FloatDistributionAnalyzer analyzer;
 
-            // 决定 HDI 求法（是否精确）
             AnalyzerConfig cfg_f;
-            cfg_f.exact_hdi = true;   // 精确最窄区间（排序法）；大数据可设 false 更快
-            cfg_f.hdi_p = 0.85;       // 仅影响打印；函数参数会再传一次 p
+            cfg_f.exact_hdi = true;
+            cfg_f.hdi_p = 0.85;
             AnalysisResult R_filtered;
-            analyzer.save_histogram_hdi_filtered(data, hdi_p, imgW, imgH, cfg_f,
-                prefix+"hdi85_hist.png", &R_filtered);
-            
-            AnalysisResult R; // 如需在代码中使用结果，可传出
-            if (!analyzer.run(data, opt, &R))
-            {
-                std::cerr << "分析失败\n";
-            }
+            analyzer.save_histogram_hdi_filtered(
+                data, hdi_p, imgW, imgH, cfg_f, prefix + "hdi85_hist.png", &R_filtered);
 
-            cv::Mat img = analyzer.draw_histogram_hdi_filtered(data,  hdi_p,
-                imgW, imgH, cfg_f, &R_filtered);
-            cv::imwrite(prefix+"hdi85_hist_new.png", img);
-            // 控制台打印结果（可选）
-            AnalyzerConfig cfg; cfg.exact_quantiles = opt.exact_quantiles; cfg.exact_hdi = opt.exact_hdi; cfg.hdi_p = opt.hdi_p;
+            AnalysisResult R;
+            if (!analyzer.run(data, opt, &R))
+                std::cerr << "分析失败\n";
+
+            cv::Mat img = analyzer.draw_histogram_hdi_filtered(
+                data, hdi_p, imgW, imgH, cfg_f, &R_filtered);
+            cv::imwrite(prefix + "hdi85_hist_new.png", img);
+
+            AnalyzerConfig cfg;
+            cfg.exact_quantiles = opt.exact_quantiles;
+            cfg.exact_hdi = opt.exact_hdi;
+            cfg.hdi_p = opt.hdi_p;
             print_result(R, cfg);
         }
 
         std::vector<PointList> PointCloud_Object;
         Virtual2ObjectDepth(PointCloud_Object, PointCloud);
         std::string object_ply_path = m_strSavePath + "/object_3dmodel.ply";
-        StoreColorPlyFileBinaryPointCloud (object_ply_path, PointCloud_Object);
+        StoreColorPlyFileBinaryPointCloud(object_ply_path, PointCloud_Object);
+
         LOG_ERROR("LFRefocus: FuseVirtualDepth_BackProject, End");
     }
-
 
     float LFRefocus::ComputeVirtualDepth(const double disparity, const LightFieldParams& params)
     {
