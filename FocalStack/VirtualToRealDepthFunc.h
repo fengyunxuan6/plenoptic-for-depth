@@ -11,12 +11,15 @@ namespace LFMVS
     enum VTORDType
     {
         VTORD_Behavioralmodel,
+        VTORD_SegmentBehavioralmodel,
+        VTORD_SegmentBehavioralmodel_2
     };
 
     enum SamplePointSelectType
     {
         SPSelectByLocalWindow,
         SPSelectByGlobal,
+        SPSelectByRandom,
     };
 
     class VirtualToRealDepthFunc
@@ -37,6 +40,8 @@ namespace LFMVS
 
         void VirtualToRealDepth(QuadTreeProblemMapMap::iterator& itrP);
 
+        cv::Mat ConvertVdImageToRd(cv::Mat virtualDepthImage);
+
         void SamplePointSelect();
 
     public:
@@ -48,9 +53,36 @@ namespace LFMVS
             float rDepth;
         };
 
+        struct SamplePoint
+        {
+            int colIndex;
+            int rowIndex;
+            float vDepth;
+            float gtDepth;
+        };
+
+        struct DepthSegment
+        {
+            float gtStart;                     // 区间起点
+            float gtEnd;                       // 区间终点
+            float vdLower;                     // gtStart 对应的 vd
+            float vdUpper;                     // gtEnd 对应的 vd
+            std::vector<SamplePoint> points;   // 该区间内的所有点
+        };
+
+        struct BehaviorSegmentResult
+        {
+            float vdepthMin;
+            float vdepthMax;
+            int sampleCount;
+            std::array<double, 3> params;
+        };
     private:
 
         void VirtualToRealDepthByBM();
+        void VirtualToRealDepthBySegBM();
+        void VirtualToRealDepthBySegBM_2();
+
 
         enum class DistanceType { Chamfer, Euclidean, Mean, Median};
 
@@ -67,9 +99,13 @@ namespace LFMVS
 
         cv::Mat convertVirtualToRealDepth( std::array<double, 3>& behaviorModelParams);
 
-       void imageDistanceSampling(cv::Mat realDepthImage, cv::Mat refDepthImage);
+        void imageDistanceSampling(cv::Mat realDepthImage, cv::Mat refDepthImage);
+        void errorStatisticsImage(cv::Mat realDepthImage, cv::Mat refDepthImage, cv::Mat bgImage, std::string errorMapSavePath);
+        void errorStatisticsImageSeg(cv::Mat realDepthImage, cv::Mat refDepthImage, cv::Mat virtualDepthImage,cv::Mat bgImage, std::string errorMapSavePath);
+        void errorStatisticsImageGTSeg(cv::Mat realDepthImage, cv::Mat bgImage, std::string errorMapSavePath);
 
-       void SamplePointSelectByLW();
+        void SamplePointSelectByLW();
+        void SamplePointSelectByRandom();
 
         cv::Mat buildOutlierMask(cv::Mat& img, int ksize, double k);
 
@@ -91,21 +127,22 @@ namespace LFMVS
 
         bool isStableGTPixel(cv::Mat &gt, int x, int y, float value, float neighbor_tol_ratio);
 
-        bool findStableGTValue(
-                        cv::Mat& gt,
-                        int vd_x,
-                        int vd_y,
-                        float& gt_value,
-                        int& gt_x,
-                        int& gt_y,
-                        int max_radius);
+        bool findStableGTValue(cv::Mat& gt, int vd_x, int vd_y, float& gt_value, int& gt_x, int& gt_y, int max_radius);
+
+        void segmentByGT(cv::Mat &m_refDepthImage,cv::Mat &focusImage);
+
+        void selectGtPoints();
+
+        void selectVdPoints();
+
+        void fitSegmentsParams(std::string xml_path);
 
     public:
         struct SampleErrorStatsOptions
                 {
                     int refSearchRadius = 50;  // 点云真值稀疏，若取值点空，则邻域半径搜索
                     int virtualSearchRadius = 50;  // 虚拟深度可能被过滤，若取值点空，则邻域半径搜索
-                    double outlierDistanceThreshold = 2000;   // 计算误差时异常距离阈值   /* mm */
+                    double outlierDistanceThreshold = 50000;   // 计算误差时异常距离阈值   /* mm */
                     int localWindowSize = 100;        // 误差计算：随机采样窗口大小
                     int sampleCount = 5;   // 误差计算：每个坐标点采样数量
                 };
@@ -126,6 +163,12 @@ namespace LFMVS
         std::vector<cv::Point>      m_samplePoints;
         std::vector<cv::Point>      m_coordsVirtual;
         std::vector<cv::Point>      m_coordsRef;
+
+        std::vector<SamplePoint> samplePoints;
+        std::vector<std::vector<SamplePoint>> samplePointsVector;
+
+        std::vector<std::vector<SamplePoint>> samplePointsVectorFiltered;
+        std::vector<std::vector<SamplePoint>> samplePointsVectorSorted;
 
     };
 
