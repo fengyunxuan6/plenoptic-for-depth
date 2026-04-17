@@ -59,6 +59,11 @@ namespace LFMVS {
                 VirtualToRealDepthBySegBM_2();
             }
                 break;
+            case VTORD_SegmentBehavioralmodel_Manual:    // 手动
+            {
+                VirtualToRealDepthByManual();
+            }
+                break;
             default:
                 break;
         }
@@ -94,7 +99,7 @@ namespace LFMVS {
         boost::filesystem::path root_path(m_strRootPath);
         boost::filesystem::path root_path_parent = root_path.parent_path();
         std::string strCalibPath = root_path_parent.string() + LF_CALIB_FOLDER_NAME;
-        std::string xml_path = strCalibPath +"behaviorModelPar amsSegment.xml";
+        std::string xml_path = strCalibPath +"behaviorModelParamsSegment.xml";
 
         m_virtualDepthImage = cv::imread(virtualDepthImg_path, cv::IMREAD_UNCHANGED);  // 读取虚拟深度图
         m_refDepthImage = cv::imread(refDepthImg_path, cv::IMREAD_UNCHANGED);   // 读取激光深度图
@@ -446,7 +451,7 @@ namespace LFMVS {
             {
                 if(centerValue != 0.0f)
                 {
-                    mean = num / (neighborValues.size()+1);
+                    mean = (num+1) / (neighborValues.size()+1);
                 } else
                 {
                     mean = num / neighborValues.size();
@@ -603,6 +608,7 @@ namespace LFMVS {
             std::array<double, 3> behaviorModelParams={0,0,0};
 
             if(refDepthValue.size()==virtualDepthValue.size() && refDepthValue.size()>=3)
+
                 behaviorModelParams = BehavioralModel(refDepthValue, virtualDepthValue);
 
             BehaviorSegmentResult seg;
@@ -3508,6 +3514,126 @@ namespace LFMVS {
 
         return found_nearest;
     }
+
+    void VirtualToRealDepthFunc::VirtualToRealDepthByManual()
+    {
+        m_strRootPath = m_ptrDepthSolver->GetRootPath();
+        std::string virtualDepthImg_path = m_strRootPath + "/behavior_model/VD_Raw.tiff";
+        std::string virtualDepthColorImg_path = m_strRootPath + "/behavior_model/m_vIDepth.png";
+        std::string refDepthImg_path = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
+        std::string focuseImg_Path = m_strRootPath + "/behavior_model/fullfocus.png";
+        std::string vDImg_marked_path = m_strRootPath + "/behavior_model/m_vIDepth_Marked.png";
+        std::string distanceImage_path = m_strRootPath + "/behavior_model/distanceImage.png";
+        boost::filesystem::path root_path(m_strRootPath);
+        boost::filesystem::path root_path_parent = root_path.parent_path();
+        std::string strCalibPath = root_path_parent.string() + LF_CALIB_FOLDER_NAME;
+        std::string xml_path = strCalibPath +"behaviorModelParamsSegment.xml";
+
+        m_virtualDepthImage = cv::imread(virtualDepthImg_path, cv::IMREAD_UNCHANGED);  // 读取虚拟深度图
+        m_refDepthImage = cv::imread(refDepthImg_path, cv::IMREAD_UNCHANGED);   // 读取激光深度图
+        cv::Mat focusImage = cv::imread(focuseImg_Path);
+        cv::Mat virtualDepthColorImg = cv::imread(virtualDepthColorImg_path);
+        cv::Mat ref_focusImage;
+        struct MouseState
+        {
+            cv::Mat focusBase;
+            cv::Mat focusShow;
+            cv::Point clickPoint;
+            std::vector<cv::Point> pointsInCircle;
+        };
+        MouseState state;
+
+
+        // Step1:窗口展示图像
+        showImagesInWindows(focusImage, virtualDepthColorImg, ref_focusImage);
+
+        // Step2: 获取参数
+        selectPoints(ref_focusImage, virtualDepthColorImg);
+
+    }
+
+    void VirtualToRealDepthFunc::showImagesInWindows(cv::Mat focusImage, cv::Mat virtualDepthColorImg,cv::Mat ref_focusImage)
+    {
+
+        if (m_refDepthImage.channels() > 1)
+            extractChannel(m_refDepthImage, m_refDepthImage, 0);
+        m_refDepthImage.convertTo(m_refDepthImage, CV_32F);
+
+        ref_focusImage = focusImage.clone();
+
+        for (int y = 0; y < m_refDepthImage.rows; ++y)
+        {
+            for (int x = 0; x < m_refDepthImage.cols; ++x)
+            {
+                float d = m_refDepthImage.at<float>(y, x);   // 如果你的深度图是16位
+                if (d > 0.0f)
+                {
+                    // 在 focusImage 上画一个亮红色点
+                    cv::circle(ref_focusImage, cv::Point(x, y), 6, cv::Scalar(0, 0, 255), -1);
+                }
+            }
+        }
+
+        cv::namedWindow("InfoPanel", cv::WINDOW_NORMAL);
+        cv::Mat emptyPanel(400, 600, CV_8UC3, cv::Scalar(255, 255, 255));
+
+        cv::namedWindow("FocusImage", cv::WINDOW_NORMAL);
+        cv::namedWindow("VirtualDepthColor", cv::WINDOW_NORMAL);
+
+        cv::imshow("FocusImage", ref_focusImage);
+        cv::imshow("VirtualDepthColor", virtualDepthColorImg);
+        cv::imshow("InfoPanel", emptyPanel);
+
+    }
+
+    void VirtualToRealDepthFunc::selectPoints(cv::Mat ref_focusImage,cv::Mat virtualDepthColorImg)
+    {
+
+        cv::setMouseCallback("FocusImage", VirtualToRealDepthFunc::onMouseFocus, this);
+        cv::waitKey(0);
+
+    }
+    void VirtualToRealDepthFunc::onMouseFocus(int event, int x, int y, int flags, void* userdata)
+    {
+        cv::Point clickPoint = cv::Point(0, 0);
+        std::vector<cv::Point> pointsInCircle;
+        int circleRadius = 10;
+
+        if (event != cv::EVENT_LBUTTONDOWN)
+            return;
+
+        VirtualToRealDepthFunc* self = static_cast<VirtualToRealDepthFunc*>(userdata);
+        if (!self)
+            return;
+
+        self->m_clickPoint = cv::Point(x, y);
+        self->m_pointsInCircle.clear();
+
+        cv::Mat focusImageShow = self->m_ref_focusImage.clone();
+
+        cv::circle(focusImageShow, clickPoint, circleRadius, cv::Scalar(0, 255, 0), 2);
+        cv::circle(focusImageShow, clickPoint, 2, cv::Scalar(255, 0, 0), -1);
+
+        int xMin = std::max(0, x - circleRadius);
+        int xMax = std::min(focusImageShow.cols - 1, x + circleRadius);
+        int yMin = std::max(0, y - circleRadius);
+        int yMax = std::min(focusImageShow.rows - 1, y + circleRadius);
+
+        for (int yy = yMin; yy <= yMax; ++yy)
+        {
+            for (int xx = xMin; xx <= xMax; ++xx)
+            {
+                int dx = xx - x;
+                int dy = yy - y;
+                if (dx * dx + dy * dy <= circleRadius * circleRadius)
+                {
+                    pointsInCircle.push_back(cv::Point(xx, yy));
+                }
+            }
+        }
+        cv::imshow("FocusImage", focusImageShow);
+    }
+
 
     // 挑选拟合多个行为模型参数的样本点
     /*void VirtualToRealDepthFunc::sampleVirtualDepthPointsByRegion(
