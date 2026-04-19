@@ -82,7 +82,7 @@ namespace LFMVS
         void VirtualToRealDepthByBM();
         void VirtualToRealDepthBySegBM();
         void VirtualToRealDepthBySegBM_2();
-
+        void VirtualToRealDepthBySegBM_new();
 
         enum class DistanceType { Chamfer, Euclidean, Mean, Median};
 
