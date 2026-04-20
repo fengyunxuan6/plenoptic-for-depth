@@ -737,8 +737,7 @@ namespace LFMVS
         adapt_frame_ACMM.WriteBackResults(disNormals_map);
         adapt_frame_ACMM.ReleaseMemory();
 
-        // v5.1：当前会先重算最终 plane 对应的 selected_views / cost，再走一遍轻过滤。
-        // 过滤仍然比原 FrameCrossViews 放宽，但不再完全忽略 selected_views。
+        // ② 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
         MIDisparityFilterConfig fcfg;
         fcfg.max_triplet = 4;
         fcfg.min_valid_disp = 0.0f;
@@ -756,6 +755,10 @@ namespace LFMVS
         fcfg.spike_min_neighbors = 3;
         fcfg.dump_debug_mask = (g_Debug_Static >= 1);
 
+        fcfg.dump_disp_error_map   = true;
+        fcfg.disp_error_thresh_px  = 0.5f;
+        fcfg.disp_error_vis_max_px = 2.0f;
+
         MIDisparityFilterStats filter_stats;
         std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
                     + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
@@ -763,6 +766,12 @@ namespace LFMVS
         filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
                             disNormals_map, fcfg, filter_stats,
                                str_filter_save_root);
+        LOG_ERROR("[DispError] frame=", strFrameName.c_str(),
+          " N=", filter_stats.num_disp_error_samples,
+          " mean=", filter_stats.mean_disp_error_px,
+          " rmse=", filter_stats.rmse_disp_error_px,
+          " p90=", filter_stats.p90_disp_error_px,
+          " thresh=", fcfg.disp_error_thresh_px);
         LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews_ACMM, End");
     }
 
