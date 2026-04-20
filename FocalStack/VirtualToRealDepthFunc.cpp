@@ -84,788 +84,1456 @@ namespace LFMVS {
         }
     }
 
-    void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
+void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
+{
+    m_strRootPath = m_ptrDepthSolver->GetRootPath();
+
+    const std::string virtualDepthImgPath = m_strRootPath + "/behavior_model/VD_Raw.tiff";
+    const std::string refDepthImgPath     = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
+    const std::string focusImgPath        = m_strRootPath + "/behavior_model/fullfocus.png";
+    const std::string debugSeedPath       = m_strRootPath + "/behavior_model/vd_seed_pairs_debug.png";
+    const std::string distanceImagePath   = m_strRootPath + "/behavior_model/distanceImage_new.png";
+
+    boost::filesystem::path rootPath(m_strRootPath);
+    boost::filesystem::path rootPathParent = rootPath.parent_path();
+    const std::string strCalibPath = rootPathParent.string() + LF_CALIB_FOLDER_NAME;
+    const std::string xmlPath      = strCalibPath + "behaviorModelParamsSegment.xml";
+
+    m_virtualDepthImage = cv::imread(virtualDepthImgPath, cv::IMREAD_UNCHANGED);
+    m_refDepthImage     = cv::imread(refDepthImgPath, cv::IMREAD_UNCHANGED);
+    cv::Mat focusImage  = cv::imread(focusImgPath, cv::IMREAD_COLOR);
+
+    if (m_virtualDepthImage.empty())
     {
-        m_strRootPath = m_ptrDepthSolver->GetRootPath();
+        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read VD image: "
+                  << virtualDepthImgPath << std::endl;
+        return;
+    }
+    if (m_refDepthImage.empty())
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read GT image: "
+                  << refDepthImgPath << std::endl;
+        return;
+    }
+    if (focusImage.empty())
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read focus image: "
+                  << focusImgPath << std::endl;
+        return;
+    }
 
-        const std::string virtualDepthImgPath = m_strRootPath + "/behavior_model/VD_Raw.tiff";
-        const std::string refDepthImgPath     = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
-        const std::string focusImgPath        = m_strRootPath + "/behavior_model/fullfocus.png";
-        const std::string debugSeedPath       = m_strRootPath + "/behavior_model/vd_seed_pairs_debug.png";
-        const std::string distanceImagePath   = m_strRootPath + "/behavior_model/distanceImage_new.png";
+    if (m_virtualDepthImage.channels() > 1)
+        extractChannel(m_virtualDepthImage, m_virtualDepthImage, 0);
+    if (m_refDepthImage.channels() > 1)
+        extractChannel(m_refDepthImage, m_refDepthImage, 0);
 
-        boost::filesystem::path rootPath(m_strRootPath);
-        boost::filesystem::path rootPathParent = rootPath.parent_path();
-        const std::string strCalibPath = rootPathParent.string() + LF_CALIB_FOLDER_NAME;
-        const std::string xmlPath      = strCalibPath + "behaviorModelParamsSegment.xml";
+    if (m_virtualDepthImage.type() != CV_32FC1)
+        m_virtualDepthImage.convertTo(m_virtualDepthImage, CV_32F);
+    if (m_refDepthImage.type() != CV_32FC1)
+        m_refDepthImage.convertTo(m_refDepthImage, CV_32F);
 
-        m_virtualDepthImage = cv::imread(virtualDepthImgPath, cv::IMREAD_UNCHANGED);
-        m_refDepthImage     = cv::imread(refDepthImgPath, cv::IMREAD_UNCHANGED);
-        cv::Mat focusImage  = cv::imread(focusImgPath, cv::IMREAD_COLOR);
+    if (focusImage.size() != m_virtualDepthImage.size())
+        cv::resize(focusImage, focusImage, m_virtualDepthImage.size(), 0.0, 0.0, cv::INTER_LINEAR);
 
-        if (m_virtualDepthImage.empty())
+    samplePoints.clear();
+    samplePointsVector.clear();
+    samplePointsVectorFiltered.clear();
+    samplePointsVectorSorted.clear();
+    m_samplePoints.clear();
+
+    struct VDCandidate
+    {
+        int x;
+        int y;
+        float vdCenter;
+        float vdMedian;
+        float vdMad;
+        float vdSpan;
+        int supportCount;
+
+        float aifGrad;
+        float grayMean;
+        float grayStd;
+        float cornerResp;
+
+        float score;
+        int cellId;
+    };
+
+    struct GTPoint
+    {
+        int x;
+        int y;
+        float value;
+    };
+
+    struct GTSupportResult
+    {
+        bool ok;
+        std::vector<float> vals;
+        std::vector<cv::Point> pts;
+        float purity;
+        float gap;
+        int usedRadius;
+
+        GTSupportResult()
+            : ok(false), purity(0.0f), gap(0.0f), usedRadius(-1)
+        {}
+    };
+
+    auto isValidValue = [](float v) -> bool
+    {
+        return std::isfinite(v) && v > 0.0f;
+    };
+
+    auto robustMedian = [](std::vector<float> vals) -> float
+    {
+        if (vals.empty())
+            return 0.0f;
+
+        const size_t mid = vals.size() / 2;
+        std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+        float med = vals[mid];
+
+        if (vals.size() % 2 == 0)
         {
-            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read VD image: "
-                      << virtualDepthImgPath << std::endl;
-            return;
+            float lower = *std::max_element(vals.begin(), vals.begin() + mid);
+            med = 0.5f * (lower + med);
         }
-        if (m_refDepthImage.empty())
+        return med;
+    };
+
+    auto quantileFromSorted = [](const std::vector<float>& sortedVals, float q) -> float
+    {
+        if (sortedVals.empty())
+            return 0.0f;
+        if (sortedVals.size() == 1)
+            return sortedVals[0];
+
+        float pos = q * static_cast<float>(sortedVals.size() - 1);
+        int lo = static_cast<int>(std::floor(pos));
+        int hi = static_cast<int>(std::ceil(pos));
+        float t = pos - static_cast<float>(lo);
+
+        if (lo == hi)
+            return sortedVals[lo];
+
+        return sortedVals[lo] * (1.0f - t) + sortedVals[hi] * t;
+    };
+
+    auto computePatchStats = [&](const cv::Mat& src,
+                                 int cx, int cy, int radius,
+                                 int minCount,
+                                 float& median,
+                                 float& mad,
+                                 float& span,
+                                 int& count) -> bool
+    {
+        std::vector<float> vals;
+        vals.reserve((2 * radius + 1) * (2 * radius + 1));
+
+        int x0 = std::max(0, cx - radius);
+        int x1 = std::min(src.cols - 1, cx + radius);
+        int y0 = std::max(0, cy - radius);
+        int y1 = std::min(src.rows - 1, cy + radius);
+
+        for (int y = y0; y <= y1; ++y)
         {
-            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read GT image: "
-                      << refDepthImgPath << std::endl;
-            return;
-        }
-        if (focusImage.empty())
-        {
-            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read focus image: "
-                      << focusImgPath << std::endl;
-            return;
-        }
-
-        if (m_virtualDepthImage.channels() > 1)
-            extractChannel(m_virtualDepthImage, m_virtualDepthImage, 0);
-        if (m_refDepthImage.channels() > 1)
-            extractChannel(m_refDepthImage, m_refDepthImage, 0);
-
-        if (m_virtualDepthImage.type() != CV_32FC1)
-            m_virtualDepthImage.convertTo(m_virtualDepthImage, CV_32F);
-        if (m_refDepthImage.type() != CV_32FC1)
-            m_refDepthImage.convertTo(m_refDepthImage, CV_32F);
-
-        if (focusImage.size() != m_virtualDepthImage.size())
-            cv::resize(focusImage, focusImage, m_virtualDepthImage.size(), 0.0, 0.0, cv::INTER_LINEAR);
-
-        samplePoints.clear();
-        samplePointsVector.clear();
-        samplePointsVectorFiltered.clear();
-        samplePointsVectorSorted.clear();
-        m_samplePoints.clear();
-
-        struct VDCandidate
-        {
-            int x;
-            int y;
-            float vdCenter;
-            float vdMedian;
-            float vdMad;
-            float vdSpan;
-            int supportCount;
-            float aifGrad;
-            float score;
-            int cellId;
-        };
-
-        struct GTPoint
-        {
-            int x;
-            int y;
-            float value;
-        };
-
-        auto isValidValue = [](float v) -> bool
-        {
-            return std::isfinite(v) && v > 0.0f;
-        };
-
-        auto robustMedian = [](std::vector<float> vals) -> float
-        {
-            if (vals.empty())
-                return 0.0f;
-            const size_t mid = vals.size() / 2;
-            std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
-            float med = vals[mid];
-            if (vals.size() % 2 == 0)
+            for (int x = x0; x <= x1; ++x)
             {
-                float lower = *std::max_element(vals.begin(), vals.begin() + mid);
-                med = 0.5f * (lower + med);
+                float v = src.at<float>(y, x);
+                if (isValidValue(v))
+                    vals.push_back(v);
             }
-            return med;
-        };
+        }
 
-        auto quantileFromSorted = [](const std::vector<float>& sortedVals, float q) -> float
+        count = static_cast<int>(vals.size());
+        if (count < minCount)
+            return false;
+
+        std::sort(vals.begin(), vals.end());
+        median = quantileFromSorted(vals, 0.5f);
+        float q10 = quantileFromSorted(vals, 0.1f);
+        float q90 = quantileFromSorted(vals, 0.9f);
+        span = q90 - q10;
+
+        std::vector<float> absDev;
+        absDev.reserve(vals.size());
+        for (size_t i = 0; i < vals.size(); ++i)
+            absDev.push_back(std::fabs(vals[i] - median));
+        std::sort(absDev.begin(), absDev.end());
+        mad = quantileFromSorted(absDev, 0.5f);
+
+        return true;
+    };
+
+    auto computeGrayPatchStats = [&](const cv::Mat& gray,
+                                     int cx, int cy, int radius,
+                                     float& meanVal,
+                                     float& stdVal) -> bool
+    {
+        int x0 = std::max(0, cx - radius);
+        int x1 = std::min(gray.cols - 1, cx + radius);
+        int y0 = std::max(0, cy - radius);
+        int y1 = std::min(gray.rows - 1, cy + radius);
+
+        cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        if (roi.width <= 0 || roi.height <= 0)
+            return false;
+
+        cv::Scalar meanS, stdS;
+        cv::meanStdDev(gray(roi), meanS, stdS);
+        meanVal = static_cast<float>(meanS[0]);
+        stdVal  = static_cast<float>(stdS[0]);
+        return true;
+    };
+
+    cv::Mat guideGray;
+    cv::cvtColor(focusImage, guideGray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(guideGray, guideGray, cv::Size(5, 5), 1.0);
+
+    cv::Mat gx, gy, guideGrad;
+    cv::Sobel(guideGray, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(guideGray, gy, CV_32F, 0, 1, 3);
+    cv::magnitude(gx, gy, guideGrad);
+    {
+        double gmax = 0.0;
+        cv::minMaxLoc(guideGrad, nullptr, &gmax);
+        if (gmax > 1e-6)
+            guideGrad.convertTo(guideGrad, CV_32F, 255.0 / gmax);
+        else
+            guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
+    }
+
+    // 结构张量最小特征值：比单纯梯度更适合筛“可匹配结构”
+    cv::Mat cornerResp;
+    cv::cornerMinEigenVal(guideGray, cornerResp, 3, 3);
+    {
+        double cmax = 0.0;
+        cv::minMaxLoc(cornerResp, nullptr, &cmax);
+        if (cmax > 1e-12)
+            cornerResp.convertTo(cornerResp, CV_32F, 255.0 / cmax);
+        else
+            cornerResp = cv::Mat::zeros(cornerResp.size(), CV_32F);
+    }
+
+    // ------------------------------------------------------------
+    // 预提取所有有效 GT 点
+    // ------------------------------------------------------------
+    std::vector<GTPoint> gtPoints;
+    gtPoints.reserve(10000);
+    for (int y = 0; y < m_refDepthImage.rows; ++y)
+    {
+        for (int x = 0; x < m_refDepthImage.cols; ++x)
         {
-            if (sortedVals.empty())
-                return 0.0f;
-            if (sortedVals.size() == 1)
-                return sortedVals[0];
-
-            float pos = q * static_cast<float>(sortedVals.size() - 1);
-            int lo = static_cast<int>(std::floor(pos));
-            int hi = static_cast<int>(std::ceil(pos));
-            float t = pos - static_cast<float>(lo);
-            if (lo == hi)
-                return sortedVals[lo];
-            return sortedVals[lo] * (1.0f - t) + sortedVals[hi] * t;
-        };
-
-        auto computePatchStats = [&](const cv::Mat& src, int cx, int cy, int radius,
-                                     int minCount,
-                                     float& median,
-                                     float& mad,
-                                     float& span,
-                                     int& count) -> bool
-        {
-            std::vector<float> vals;
-            vals.reserve((2 * radius + 1) * (2 * radius + 1));
-
-            int x0 = std::max(0, cx - radius);
-            int x1 = std::min(src.cols - 1, cx + radius);
-            int y0 = std::max(0, cy - radius);
-            int y1 = std::min(src.rows - 1, cy + radius);
-
-            for (int y = y0; y <= y1; ++y)
+            float gv = m_refDepthImage.at<float>(y, x);
+            if (isValidValue(gv))
             {
-                for (int x = x0; x <= x1; ++x)
-                {
-                    float v = src.at<float>(y, x);
-                    if (isValidValue(v))
-                        vals.push_back(v);
-                }
+                GTPoint p;
+                p.x = x;
+                p.y = y;
+                p.value = gv;
+                gtPoints.push_back(p);
+            }
+        }
+    }
+    std::cout << "[VirtualToRealDepthBySegBM_new] valid GT points: "
+              << gtPoints.size() << std::endl;
+
+    // ------------------------------------------------------------
+    // 参数
+    // ------------------------------------------------------------
+    const int   candidateStride        = 3;
+    const int   candidatePatchRadius   = 2;
+    const int   texturePatchRadius     = 3;
+    const int   candidateMinCount      = 4;
+
+    const float candidateMaxMad        = 0.045f;
+    const float candidateMaxSpan       = 0.18f;
+    const float candidateMaxGrad       = 95.0f;
+
+    // 新增：前端纹理/结构筛选
+    const float candidateDarkMeanReject = 35.0f;
+    const float candidateDarkStdReject  = 14.0f;
+    const float candidateMinGrayStd     = 8.0f;
+    const float candidateMinCornerResp  = 6.0f;
+
+    const int   gridCols               = 6;
+    const int   gridRows               = 6;
+    const int   seedsPerBin            = 18;
+    const int   vdBinCount             = 8;
+
+    const int   supportSearchRadius    = 10;
+    const int   supportMaxPoints       = 12;
+    const int   supportMinPoints       = 4;
+    const float supportBandAbsMin      = 0.03f;
+    const float supportBandMadScale    = 3.0f;
+    const float supportMinMadFloor     = 0.005f;
+
+    const float strongEdgeThresh       = 55.0f;
+    const float maxGrayJump            = 28.0f;
+
+    // 支持域额外约束
+    const float supportMinGrayStd      = 8.0f;
+    const float supportMinCornerResp   = 6.0f;
+    const float supportMaxEdgeRatio    = 0.35f;
+
+    // GT 支持：邻域搜索 + 主峰纯度
+    const std::vector<int> gtSearchRadii = {6, 12, 20, 30};
+    const int   minGtCount             = 3;
+    const float gtMadAbsTol            = 1200.0f;
+    const float gtHistBinWidth         = 2000.0f;
+
+    const float minGtPeakPurity        = 0.55f;
+    const float minGtPeakGap           = 0.08f;
+    const int   softMaxGtSearchRadius  = 20;
+
+    const int   minRepresentativePairsForFit = 12;
+
+    auto cellIdOf = [&](int x, int y) -> int
+    {
+        int cw = std::max(1, (m_virtualDepthImage.cols + gridCols - 1) / gridCols);
+        int ch = std::max(1, (m_virtualDepthImage.rows + gridRows - 1) / gridRows);
+        int cx = std::min(gridCols - 1, std::max(0, x / cw));
+        int cy = std::min(gridRows - 1, std::max(0, y / ch));
+        return cy * gridCols + cx;
+    };
+
+    // ------------------------------------------------------------
+    // Step 1: VD 候选池（加入纹理/结构筛选）
+    // ------------------------------------------------------------
+    std::vector<VDCandidate> candidatePool;
+    candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
+                          (m_virtualDepthImage.cols / candidateStride));
+
+    float vdMinAll = std::numeric_limits<float>::infinity();
+    float vdMaxAll = 0.0f;
+
+    for (int y = candidatePatchRadius; y < m_virtualDepthImage.rows - candidatePatchRadius; y += candidateStride)
+    {
+        for (int x = candidatePatchRadius; x < m_virtualDepthImage.cols - candidatePatchRadius; x += candidateStride)
+        {
+            float center = m_virtualDepthImage.at<float>(y, x);
+            if (!isValidValue(center))
+                continue;
+
+            float median = 0.0f, mad = 0.0f, span = 0.0f;
+            int count = 0;
+            if (!computePatchStats(m_virtualDepthImage, x, y,
+                                   candidatePatchRadius,
+                                   candidateMinCount,
+                                   median, mad, span, count))
+            {
+                continue;
             }
 
-            count = static_cast<int>(vals.size());
-            if (count < minCount)
+            float grad = guideGrad.at<float>(y, x);
+
+            float grayMean = 0.0f, grayStd = 0.0f;
+            if (!computeGrayPatchStats(guideGray, x, y, texturePatchRadius, grayMean, grayStd))
+                continue;
+
+            float corner = cornerResp.at<float>(y, x);
+
+            // VD 本身先要稳
+            if (mad > candidateMaxMad) continue;
+            if (span > candidateMaxSpan) continue;
+            if (grad > candidateMaxGrad) continue;
+
+            // 新增：暗弱纹理区尽量不要
+            if (grayMean < candidateDarkMeanReject && grayStd < candidateDarkStdReject)
+                continue;
+
+            // 新增：平坦/单调弱结构区尽量不要
+            if (grayStd < candidateMinGrayStd && corner < candidateMinCornerResp)
+                continue;
+
+            float texturePenalty = 0.0f;
+            if (grayStd < 14.0f) texturePenalty += (14.0f - grayStd) * 0.10f;
+            if (corner < 10.0f) texturePenalty += (10.0f - corner) * 0.08f;
+            if (grayMean < 40.0f) texturePenalty += (40.0f - grayMean) * 0.02f;
+
+            VDCandidate c;
+            c.x = x;
+            c.y = y;
+            c.vdCenter = center;
+            c.vdMedian = median;
+            c.vdMad = mad;
+            c.vdSpan = span;
+            c.supportCount = count;
+            c.aifGrad = grad;
+            c.grayMean = grayMean;
+            c.grayStd = grayStd;
+            c.cornerResp = corner;
+            c.score = mad * 8.0f + span * 4.0f + grad * 0.02f + texturePenalty;
+            c.cellId = cellIdOf(x, y);
+            candidatePool.push_back(c);
+
+            vdMinAll = std::min(vdMinAll, median);
+            vdMaxAll = std::max(vdMaxAll, median);
+        }
+    }
+
+    std::cout << "[VirtualToRealDepthBySegBM_new] VD candidate pool size: "
+              << candidatePool.size() << std::endl;
+
+    if (candidatePool.size() < 3 || !(std::isfinite(vdMinAll) && std::isfinite(vdMaxAll) && vdMaxAll > vdMinAll))
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] no usable VD candidate pool." << std::endl;
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // Step 2: 按 VD 分段选 seed
+    // ------------------------------------------------------------
+    struct VDBin
+    {
+        float low;
+        float high;
+        std::vector<VDCandidate> candidates;
+    };
+
+    std::vector<VDBin> bins(vdBinCount);
+    const float step = (vdMaxAll - vdMinAll) / static_cast<float>(vdBinCount);
+    for (int i = 0; i < vdBinCount; ++i)
+    {
+        bins[i].low = vdMinAll + step * static_cast<float>(i);
+        bins[i].high = (i == vdBinCount - 1)
+                       ? (vdMaxAll + 1e-6f)
+                       : (vdMinAll + step * static_cast<float>(i + 1));
+    }
+
+    for (size_t i = 0; i < candidatePool.size(); ++i)
+    {
+        float v = candidatePool[i].vdMedian;
+        for (int b = 0; b < vdBinCount; ++b)
+        {
+            bool inRange = (b == vdBinCount - 1)
+                           ? (v >= bins[b].low && v <= bins[b].high)
+                           : (v >= bins[b].low && v < bins[b].high);
+            if (inRange)
+            {
+                bins[b].candidates.push_back(candidatePool[i]);
+                break;
+            }
+        }
+    }
+
+    std::vector<VDCandidate> selectedSeeds;
+    selectedSeeds.reserve(vdBinCount * seedsPerBin);
+    std::vector<cv::Point> selectedSeedPts;
+
+    auto isFarEnough = [&](int x, int y, int minDistPx) -> bool
+    {
+        for (size_t i = 0; i < selectedSeedPts.size(); ++i)
+        {
+            int dx = selectedSeedPts[i].x - x;
+            int dy = selectedSeedPts[i].y - y;
+            if (dx * dx + dy * dy < minDistPx * minDistPx)
                 return false;
+        }
+        return true;
+    };
 
-            std::sort(vals.begin(), vals.end());
-            median = quantileFromSorted(vals, 0.5f);
-            float q10 = quantileFromSorted(vals, 0.1f);
-            float q90 = quantileFromSorted(vals, 0.9f);
-            span = q90 - q10;
+    for (int b = 0; b < vdBinCount; ++b)
+    {
+        if (bins[b].candidates.empty())
+            continue;
 
-            std::vector<float> absDev;
-            absDev.reserve(vals.size());
-            for (size_t i = 0; i < vals.size(); ++i)
-                absDev.push_back(std::fabs(vals[i] - median));
-            std::sort(absDev.begin(), absDev.end());
-            mad = quantileFromSorted(absDev, 0.5f);
-            return true;
-        };
+        std::map<int, std::vector<VDCandidate> > byCell;
+        for (size_t i = 0; i < bins[b].candidates.size(); ++i)
+            byCell[bins[b].candidates[i].cellId].push_back(bins[b].candidates[i]);
 
-        cv::Mat guideGray;
-        cv::cvtColor(focusImage, guideGray, cv::COLOR_BGR2GRAY);
-        cv::GaussianBlur(guideGray, guideGray, cv::Size(5, 5), 1.0);
-
-        cv::Mat gx, gy, guideGrad;
-        cv::Sobel(guideGray, gx, CV_32F, 1, 0, 3);
-        cv::Sobel(guideGray, gy, CV_32F, 0, 1, 3);
-        cv::magnitude(gx, gy, guideGrad);
+        for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
         {
-            double gmax = 0.0;
-            cv::minMaxLoc(guideGrad, nullptr, &gmax);
-            if (gmax > 1e-6)
-                guideGrad.convertTo(guideGrad, CV_32F, 255.0 / gmax);
-            else
-                guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
+            std::sort(it->second.begin(), it->second.end(),
+                      [](const VDCandidate& a, const VDCandidate& b)
+                      {
+                          if (std::fabs(a.score - b.score) > 1e-6f)
+                              return a.score < b.score;
+                          if (a.y != b.y) return a.y < b.y;
+                          return a.x < b.x;
+                      });
         }
 
-        // ------------------------------------------------------------
-        // 预提取所有有效 GT 点
-        // ------------------------------------------------------------
-        std::vector<GTPoint> gtPoints;
-        gtPoints.reserve(10000);
-        for (int y = 0; y < m_refDepthImage.rows; ++y)
+        std::vector<int> cellOrder;
+        for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
+            cellOrder.push_back(it->first);
+        std::sort(cellOrder.begin(), cellOrder.end());
+
+        std::map<int, size_t> cursor;
+        for (size_t i = 0; i < cellOrder.size(); ++i)
+            cursor[cellOrder[i]] = 0;
+
+        int picked = 0;
+        bool progress = true;
+        while (picked < seedsPerBin && progress)
         {
-            for (int x = 0; x < m_refDepthImage.cols; ++x)
+            progress = false;
+            for (size_t ci = 0; ci < cellOrder.size() && picked < seedsPerBin; ++ci)
             {
-                float gv = m_refDepthImage.at<float>(y, x);
-                if (isValidValue(gv))
+                int cid = cellOrder[ci];
+                std::vector<VDCandidate>& vec = byCell[cid];
+                while (cursor[cid] < vec.size())
                 {
-                    GTPoint p;
-                    p.x = x;
-                    p.y = y;
-                    p.value = gv;
-                    gtPoints.push_back(p);
-                }
-            }
-        }
-        std::cout << "[VirtualToRealDepthBySegBM_new] valid GT points: "
-                  << gtPoints.size() << std::endl;
+                    const VDCandidate& cand = vec[cursor[cid]++];
+                    if (!isFarEnough(cand.x, cand.y, 18))
+                        continue;
 
-        const int   candidateStride        = 3;
-        const int   candidatePatchRadius   = 2;
-        const int   candidateMinCount      = 4;
-        const float candidateMaxMad        = 0.045f;
-        const float candidateMaxSpan       = 0.18f;
-        const float candidateMaxGrad       = 95.0f;
-        const int   gridCols               = 6;
-        const int   gridRows               = 6;
-        const int   seedsPerBin            = 18;
-        const int   vdBinCount             = 8;
-
-        const int   supportSearchRadius    = 10;
-        const int   supportMaxPoints       = 12;
-        const int   supportMinPoints       = 4;
-        const float supportBandAbsMin      = 0.03f;
-        const float supportBandMadScale    = 3.0f;
-        const float supportMinMadFloor     = 0.005f;
-
-        const float strongEdgeThresh       = 55.0f;
-        const float maxGrayJump            = 28.0f;
-
-        // GT 支持不再用固定 3px mask 重叠，而是逐级扩展搜索
-        const std::vector<int> gtSearchRadii = {6, 12, 20, 30};
-        const int   minGtCount             = 3;
-        const float gtMadAbsTol            = 1200.0f;
-        const float gtHistBinWidth         = 2000.0f;  // 单位按你的 GT 图（大概率 mm）
-
-        auto cellIdOf = [&](int x, int y) -> int
-        {
-            int cw = std::max(1, (m_virtualDepthImage.cols + gridCols - 1) / gridCols);
-            int ch = std::max(1, (m_virtualDepthImage.rows + gridRows - 1) / gridRows);
-            int cx = std::min(gridCols - 1, std::max(0, x / cw));
-            int cy = std::min(gridRows - 1, std::max(0, y / ch));
-            return cy * gridCols + cx;
-        };
-
-        std::vector<VDCandidate> candidatePool;
-        candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
-                              (m_virtualDepthImage.cols / candidateStride));
-
-        float vdMinAll = std::numeric_limits<float>::infinity();
-        float vdMaxAll = 0.0f;
-
-        for (int y = candidatePatchRadius; y < m_virtualDepthImage.rows - candidatePatchRadius; y += candidateStride)
-        {
-            for (int x = candidatePatchRadius; x < m_virtualDepthImage.cols - candidatePatchRadius; x += candidateStride)
-            {
-                float center = m_virtualDepthImage.at<float>(y, x);
-                if (!isValidValue(center))
-                    continue;
-
-                float median = 0.0f, mad = 0.0f, span = 0.0f;
-                int count = 0;
-                if (!computePatchStats(m_virtualDepthImage, x, y,
-                                       candidatePatchRadius,
-                                       candidateMinCount,
-                                       median, mad, span, count))
-                {
-                    continue;
-                }
-
-                float grad = guideGrad.at<float>(y, x);
-                if (mad > candidateMaxMad)  continue;
-                if (span > candidateMaxSpan) continue;
-                if (grad > candidateMaxGrad) continue;
-
-                VDCandidate c;
-                c.x = x;
-                c.y = y;
-                c.vdCenter = center;
-                c.vdMedian = median;
-                c.vdMad = mad;
-                c.vdSpan = span;
-                c.supportCount = count;
-                c.aifGrad = grad;
-                c.score = mad * 8.0f + span * 4.0f + grad * 0.02f;
-                c.cellId = cellIdOf(x, y);
-                candidatePool.push_back(c);
-
-                vdMinAll = std::min(vdMinAll, median);
-                vdMaxAll = std::max(vdMaxAll, median);
-            }
-        }
-
-        std::cout << "[VirtualToRealDepthBySegBM_new] VD candidate pool size: "
-                  << candidatePool.size() << std::endl;
-
-        if (candidatePool.size() < 3 || !(std::isfinite(vdMinAll) && std::isfinite(vdMaxAll) && vdMaxAll > vdMinAll))
-        {
-            std::cout << "[VirtualToRealDepthBySegBM_new] no usable VD candidate pool." << std::endl;
-            return;
-        }
-
-        struct VDBin
-        {
-            float low;
-            float high;
-            std::vector<VDCandidate> candidates;
-        };
-
-        std::vector<VDBin> bins(vdBinCount);
-        const float step = (vdMaxAll - vdMinAll) / static_cast<float>(vdBinCount);
-        for (int i = 0; i < vdBinCount; ++i)
-        {
-            bins[i].low = vdMinAll + step * static_cast<float>(i);
-            bins[i].high = (i == vdBinCount - 1) ? (vdMaxAll + 1e-6f) : (vdMinAll + step * static_cast<float>(i + 1));
-        }
-
-        for (size_t i = 0; i < candidatePool.size(); ++i)
-        {
-            float v = candidatePool[i].vdMedian;
-            for (int b = 0; b < vdBinCount; ++b)
-            {
-                bool inRange = (b == vdBinCount - 1) ? (v >= bins[b].low && v <= bins[b].high)
-                                                     : (v >= bins[b].low && v < bins[b].high);
-                if (inRange)
-                {
-                    bins[b].candidates.push_back(candidatePool[i]);
+                    selectedSeeds.push_back(cand);
+                    selectedSeedPts.push_back(cv::Point(cand.x, cand.y));
+                    ++picked;
+                    progress = true;
                     break;
                 }
             }
         }
-
-        std::vector<VDCandidate> selectedSeeds;
-        selectedSeeds.reserve(vdBinCount * seedsPerBin);
-        std::vector<cv::Point> selectedSeedPts;
-
-        auto isFarEnough = [&](int x, int y, int minDistPx) -> bool
-        {
-            for (size_t i = 0; i < selectedSeedPts.size(); ++i)
-            {
-                int dx = selectedSeedPts[i].x - x;
-                int dy = selectedSeedPts[i].y - y;
-                if (dx * dx + dy * dy < minDistPx * minDistPx)
-                    return false;
-            }
-            return true;
-        };
-
-        for (int b = 0; b < vdBinCount; ++b)
-        {
-            if (bins[b].candidates.empty())
-                continue;
-
-            std::map<int, std::vector<VDCandidate>> byCell;
-            for (size_t i = 0; i < bins[b].candidates.size(); ++i)
-                byCell[bins[b].candidates[i].cellId].push_back(bins[b].candidates[i]);
-
-            for (std::map<int, std::vector<VDCandidate>>::iterator it = byCell.begin(); it != byCell.end(); ++it)
-            {
-                std::sort(it->second.begin(), it->second.end(),
-                          [](const VDCandidate& a, const VDCandidate& b)
-                          {
-                              if (std::fabs(a.score - b.score) > 1e-6f)
-                                  return a.score < b.score;
-                              if (a.y != b.y) return a.y < b.y;
-                              return a.x < b.x;
-                          });
-            }
-
-            std::vector<int> cellOrder;
-            for (std::map<int, std::vector<VDCandidate>>::iterator it = byCell.begin(); it != byCell.end(); ++it)
-                cellOrder.push_back(it->first);
-            std::sort(cellOrder.begin(), cellOrder.end());
-
-            std::map<int, size_t> cursor;
-            for (size_t i = 0; i < cellOrder.size(); ++i)
-                cursor[cellOrder[i]] = 0;
-
-            int picked = 0;
-            bool progress = true;
-            while (picked < seedsPerBin && progress)
-            {
-                progress = false;
-                for (size_t ci = 0; ci < cellOrder.size() && picked < seedsPerBin; ++ci)
-                {
-                    int cid = cellOrder[ci];
-                    std::vector<VDCandidate>& vec = byCell[cid];
-                    while (cursor[cid] < vec.size())
-                    {
-                        const VDCandidate& cand = vec[cursor[cid]++];
-                        if (!isFarEnough(cand.x, cand.y, 18))
-                            continue;
-                        selectedSeeds.push_back(cand);
-                        selectedSeedPts.push_back(cv::Point(cand.x, cand.y));
-                        ++picked;
-                        progress = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        std::cout << "[VirtualToRealDepthBySegBM_new] VD seed count: "
-                  << selectedSeeds.size() << std::endl;
-
-        if (selectedSeeds.size() < 3)
-        {
-            std::cout << "[VirtualToRealDepthBySegBM_new] not enough VD seeds." << std::endl;
-            return;
-        }
-
-        auto crossesStrongEdge = [&](int x0, int y0, int x1, int y1) -> bool
-        {
-            const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-            if (steps <= 1)
-                return false;
-
-            float prevGray = static_cast<float>(guideGray.at<uchar>(y0, x0));
-
-            for (int s = 1; s < steps; ++s)
-            {
-                float t = static_cast<float>(s) / static_cast<float>(steps);
-                int x = static_cast<int>(std::round((1.0f - t) * x0 + t * x1));
-                int y = static_cast<int>(std::round((1.0f - t) * y0 + t * y1));
-                x = std::max(0, std::min(guideGrad.cols - 1, x));
-                y = std::max(0, std::min(guideGrad.rows - 1, y));
-
-                float g = guideGrad.at<float>(y, x);
-                float curGray = static_cast<float>(guideGray.at<uchar>(y, x));
-                float dGray = std::fabs(curGray - prevGray);
-
-                if (g > strongEdgeThresh && dGray > maxGrayJump)
-                    return true;
-
-                prevGray = curGray;
-            }
-            return false;
-        };
-
-        auto distancePointToSupport = [&](int x, int y, const std::vector<cv::Point>& supportPts, int& nearestIdx) -> float
-        {
-            float bestD2 = std::numeric_limits<float>::infinity();
-            nearestIdx = -1;
-            for (size_t i = 0; i < supportPts.size(); ++i)
-            {
-                float dx = static_cast<float>(x - supportPts[i].x);
-                float dy = static_cast<float>(y - supportPts[i].y);
-                float d2 = dx * dx + dy * dy;
-                if (d2 < bestD2)
-                {
-                    bestD2 = d2;
-                    nearestIdx = static_cast<int>(i);
-                }
-            }
-            return bestD2;
-        };
-
-        auto collectGTSupportNearVDSupport = [&](const std::vector<cv::Point>& vdSupportPts,
-                                                 std::vector<float>& gtVals,
-                                                 std::vector<cv::Point>& gtSupportPts) -> bool
-        {
-            gtVals.clear();
-            gtSupportPts.clear();
-
-            if (vdSupportPts.empty() || gtPoints.empty())
-                return false;
-
-            // 1) VD 支持域几何摘要
-            int minX = std::numeric_limits<int>::max();
-            int minY = std::numeric_limits<int>::max();
-            int maxX = 0;
-            int maxY = 0;
-            float cx = 0.0f, cy = 0.0f;
-
-            for (size_t i = 0; i < vdSupportPts.size(); ++i)
-            {
-                minX = std::min(minX, vdSupportPts[i].x);
-                minY = std::min(minY, vdSupportPts[i].y);
-                maxX = std::max(maxX, vdSupportPts[i].x);
-                maxY = std::max(maxY, vdSupportPts[i].y);
-                cx += static_cast<float>(vdSupportPts[i].x);
-                cy += static_cast<float>(vdSupportPts[i].y);
-            }
-            cx /= static_cast<float>(vdSupportPts.size());
-            cy /= static_cast<float>(vdSupportPts.size());
-
-            struct GTCandidate
-            {
-                int x;
-                int y;
-                float value;
-                float nearD2;
-                float centroidD2;
-                float weight;
-            };
-
-            // 2) 逐级扩大搜索范围，在 Ω_vd 附近找 GT 稀疏支撑
-            for (size_t rid = 0; rid < gtSearchRadii.size(); ++rid)
-            {
-                int R = gtSearchRadii[rid];
-
-                int bx0 = std::max(0, minX - R);
-                int by0 = std::max(0, minY - R);
-                int bx1 = std::min(m_refDepthImage.cols - 1, maxX + R);
-                int by1 = std::min(m_refDepthImage.rows - 1, maxY + R);
-
-                std::vector<GTCandidate> candidates;
-                candidates.reserve(128);
-
-                for (size_t gi = 0; gi < gtPoints.size(); ++gi)
-                {
-                    const GTPoint& gp = gtPoints[gi];
-
-                    if (gp.x < bx0 || gp.x > bx1 || gp.y < by0 || gp.y > by1)
-                        continue;
-
-                    int nearestIdx = -1;
-                    float nearD2 = distancePointToSupport(gp.x, gp.y, vdSupportPts, nearestIdx);
-
-                    // 和 VD 支持域至少要“附近”
-                    if (nearD2 > static_cast<float>(R * R))
-                        continue;
-
-                    if (nearestIdx < 0)
-                        continue;
-
-                    // AIF 只做边界阻断：从最近 support 点到 GT 点之间不能跨强边界
-                    const cv::Point& anchor = vdSupportPts[nearestIdx];
-                    if (crossesStrongEdge(anchor.x, anchor.y, gp.x, gp.y))
-                        continue;
-
-                    float dcx = static_cast<float>(gp.x) - cx;
-                    float dcy = static_cast<float>(gp.y) - cy;
-                    float centroidD2 = dcx * dcx + dcy * dcy;
-
-                    // 权重：越靠近 support / centroid 越大
-                    float w = 1.0f / (1.0f + 0.25f * nearD2 + 0.05f * centroidD2);
-
-                    GTCandidate c;
-                    c.x = gp.x;
-                    c.y = gp.y;
-                    c.value = gp.value;
-                    c.nearD2 = nearD2;
-                    c.centroidD2 = centroidD2;
-                    c.weight = w;
-                    candidates.push_back(c);
-                }
-
-                if (static_cast<int>(candidates.size()) < minGtCount)
-                    continue;
-
-                // 3) 用加权直方图找 GT 主峰，避免混入前景/背景
-                float minGT = std::numeric_limits<float>::infinity();
-                float maxGT = 0.0f;
-                for (size_t i = 0; i < candidates.size(); ++i)
-                {
-                    minGT = std::min(minGT, candidates[i].value);
-                    maxGT = std::max(maxGT, candidates[i].value);
-                }
-
-                if (!(std::isfinite(minGT) && std::isfinite(maxGT) && maxGT >= minGT))
-                    continue;
-
-                float histStart = std::floor(minGT / gtHistBinWidth) * gtHistBinWidth;
-                float histEnd   = std::ceil((maxGT + gtHistBinWidth) / gtHistBinWidth) * gtHistBinWidth;
-                int histBins = std::max(1, static_cast<int>(std::ceil((histEnd - histStart) / gtHistBinWidth)));
-
-                std::vector<double> hist(histBins, 0.0);
-                auto toBin = [&](float v) -> int
-                {
-                    int idx = static_cast<int>(std::floor((v - histStart) / gtHistBinWidth));
-                    idx = std::max(0, std::min(histBins - 1, idx));
-                    return idx;
-                };
-
-                for (size_t i = 0; i < candidates.size(); ++i)
-                {
-                    hist[toBin(candidates[i].value)] += candidates[i].weight;
-                }
-
-                int bestBin = 0;
-                double bestScore = hist[0];
-                for (int b = 1; b < histBins; ++b)
-                {
-                    if (hist[b] > bestScore)
-                    {
-                        bestScore = hist[b];
-                        bestBin = b;
-                    }
-                }
-
-                float binLow = histStart + bestBin * gtHistBinWidth;
-                float binHigh = binLow + gtHistBinWidth;
-                float binCenter = 0.5f * (binLow + binHigh);
-
-                std::vector<float> peakVals;
-                std::vector<cv::Point> peakPts;
-                peakVals.reserve(candidates.size());
-                peakPts.reserve(candidates.size());
-
-                for (size_t i = 0; i < candidates.size(); ++i)
-                {
-                    if (candidates[i].value >= binLow && candidates[i].value < binHigh)
-                    {
-                        peakVals.push_back(candidates[i].value);
-                        peakPts.push_back(cv::Point(candidates[i].x, candidates[i].y));
-                    }
-                }
-
-                if (static_cast<int>(peakVals.size()) < minGtCount)
-                    continue;
-
-                // 4) median + MAD 再精炼
-                std::vector<float> sortedPeak = peakVals;
-                std::sort(sortedPeak.begin(), sortedPeak.end());
-                float med = quantileFromSorted(sortedPeak, 0.5f);
-
-                std::vector<float> absDev;
-                absDev.reserve(sortedPeak.size());
-                for (size_t i = 0; i < sortedPeak.size(); ++i)
-                    absDev.push_back(std::fabs(sortedPeak[i] - med));
-                std::sort(absDev.begin(), absDev.end());
-                float mad = quantileFromSorted(absDev, 0.5f);
-                float tol = std::max(gtMadAbsTol, 3.0f * std::max(mad, 1.0f));
-
-                std::vector<float> finalVals;
-                std::vector<cv::Point> finalPts;
-                finalVals.reserve(peakVals.size());
-                finalPts.reserve(peakPts.size());
-
-                for (size_t i = 0; i < peakVals.size(); ++i)
-                {
-                    if (std::fabs(peakVals[i] - med) <= tol)
-                    {
-                        finalVals.push_back(peakVals[i]);
-                        finalPts.push_back(peakPts[i]);
-                    }
-                }
-
-                if (static_cast<int>(finalVals.size()) >= minGtCount)
-                {
-                    gtVals.swap(finalVals);
-                    gtSupportPts.swap(finalPts);
-                    return true;
-                }
-            }
-
-            return false;
-        };
-
-        cv::Mat debugVis = focusImage.clone();
-        int rejectSupportTooSmall = 0;
-        int rejectNoGTSupport = 0;
-        int rejectEdgeCross = 0;
-
-        for (size_t i = 0; i < selectedSeeds.size(); ++i)
-        {
-            const VDCandidate& seed = selectedSeeds[i];
-            float band = std::max(supportBandAbsMin,
-                                  supportBandMadScale * std::max(seed.vdMad, supportMinMadFloor));
-
-            struct Neighbor
-            {
-                int x;
-                int y;
-                float vd;
-                float dist2;
-            };
-
-            std::vector<Neighbor> neighbors;
-            neighbors.reserve((2 * supportSearchRadius + 1) * (2 * supportSearchRadius + 1));
-
-            int x0 = std::max(0, seed.x - supportSearchRadius);
-            int x1 = std::min(m_virtualDepthImage.cols - 1, seed.x + supportSearchRadius);
-            int y0 = std::max(0, seed.y - supportSearchRadius);
-            int y1 = std::min(m_virtualDepthImage.rows - 1, seed.y + supportSearchRadius);
-
-            for (int y = y0; y <= y1; ++y)
-            {
-                for (int x = x0; x <= x1; ++x)
-                {
-                    float v = m_virtualDepthImage.at<float>(y, x);
-                    if (!isValidValue(v))
-                        continue;
-                    if (std::fabs(v - seed.vdMedian) > band)
-                        continue;
-                    if (crossesStrongEdge(seed.x, seed.y, x, y))
-                    {
-                        ++rejectEdgeCross;
-                        continue;
-                    }
-                    float d2 = static_cast<float>((x - seed.x) * (x - seed.x) + (y - seed.y) * (y - seed.y));
-                    neighbors.push_back({x, y, v, d2});
-                }
-            }
-
-            if (neighbors.empty())
-            {
-                ++rejectSupportTooSmall;
-                continue;
-            }
-
-            std::sort(neighbors.begin(), neighbors.end(),
-                      [](const Neighbor& a, const Neighbor& b)
-                      {
-                          return a.dist2 < b.dist2;
-                      });
-
-            std::vector<cv::Point> supportPts;
-            std::vector<float> supportVDVals;
-            supportPts.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
-            supportVDVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
-
-            for (size_t k = 0; k < neighbors.size() && static_cast<int>(supportPts.size()) < supportMaxPoints; ++k)
-            {
-                supportPts.push_back(cv::Point(neighbors[k].x, neighbors[k].y));
-                supportVDVals.push_back(neighbors[k].vd);
-            }
-
-            if (static_cast<int>(supportPts.size()) < supportMinPoints)
-            {
-                ++rejectSupportTooSmall;
-                continue;
-            }
-
-            std::sort(supportVDVals.begin(), supportVDVals.end());
-            float vdRep = quantileFromSorted(supportVDVals, 0.5f);
-
-            std::vector<float> gtVals;
-            std::vector<cv::Point> gtSupportPts;
-            if (!collectGTSupportNearVDSupport(supportPts, gtVals, gtSupportPts))
-            {
-                ++rejectNoGTSupport;
-                continue;
-            }
-
-            std::sort(gtVals.begin(), gtVals.end());
-            float gtRep = quantileFromSorted(gtVals, 0.5f);
-
-            if (!isValidValue(vdRep) || !isValidValue(gtRep))
-                continue;
-
-            SamplePoint sp;
-            sp.colIndex = seed.x;
-            sp.rowIndex = seed.y;
-            sp.vDepth = vdRep;
-            sp.gtDepth = gtRep;
-            samplePoints.push_back(sp);
-
-            // 调试可视化
-            cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2); // 红：seed
-            for (size_t k = 0; k < supportPts.size(); ++k)
-                cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);      // 黄：vd support
-            for (size_t k = 0; k < gtSupportPts.size(); ++k)
-                cv::circle(debugVis, gtSupportPts[k], 2, cv::Scalar(0, 255, 0), -1);       // 绿：gt support
-        }
-
-        std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
-                  << samplePoints.size() << std::endl;
-        std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportTooSmall: "
-                  << rejectSupportTooSmall << std::endl;
-        std::cout << "[VirtualToRealDepthBySegBM_new] rejectNoGTSupport: "
-                  << rejectNoGTSupport << std::endl;
-        std::cout << "[VirtualToRealDepthBySegBM_new] rejectEdgeCross: "
-                  << rejectEdgeCross << std::endl;
-
-        if (!debugVis.empty())
-            cv::imwrite(debugSeedPath, debugVis);
-
-        if (samplePoints.size() < 3)
-        {
-            std::cout << "[VirtualToRealDepthBySegBM_new] not enough representative pairs." << std::endl;
-            return;
-        }
-
-        fitSegmentsParams(xmlPath);
-
-        cv::Mat realDepthImage = ConvertVdImageToRd(m_virtualDepthImage);
-        if (realDepthImage.empty())
-        {
-            std::cout << "[VirtualToRealDepthBySegBM_new] ConvertVdImageToRd failed." << std::endl;
-            return;
-        }
-
-        SamplePointSelect();
-        errorStatisticsImageSeg(realDepthImage,
-                                m_refDepthImage,
-                                m_virtualDepthImage,
-                                focusImage,
-                                distanceImagePath);
-        std::cout << "[VirtualToRealDepthBySegBM_new] done." << std::endl;
     }
 
+    std::cout << "[VirtualToRealDepthBySegBM_new] VD seed count: "
+              << selectedSeeds.size() << std::endl;
+
+    if (selectedSeeds.size() < 3)
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] not enough VD seeds." << std::endl;
+        return;
+    }
+
+    auto crossesStrongEdge = [&](int x0, int y0, int x1, int y1) -> bool
+    {
+        const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+        if (steps <= 1)
+            return false;
+
+        float prevGray = static_cast<float>(guideGray.at<uchar>(y0, x0));
+
+        for (int s = 1; s < steps; ++s)
+        {
+            float t = static_cast<float>(s) / static_cast<float>(steps);
+            int x = static_cast<int>(std::round((1.0f - t) * x0 + t * x1));
+            int y = static_cast<int>(std::round((1.0f - t) * y0 + t * y1));
+            x = std::max(0, std::min(guideGrad.cols - 1, x));
+            y = std::max(0, std::min(guideGrad.rows - 1, y));
+
+            float g = guideGrad.at<float>(y, x);
+            float curGray = static_cast<float>(guideGray.at<uchar>(y, x));
+            float dGray = std::fabs(curGray - prevGray);
+
+            if (g > strongEdgeThresh && dGray > maxGrayJump)
+                return true;
+
+            prevGray = curGray;
+        }
+        return false;
+    };
+
+    auto distancePointToSupport = [&](int x, int y, const std::vector<cv::Point>& supportPts, int& nearestIdx) -> float
+    {
+        float bestD2 = std::numeric_limits<float>::infinity();
+        nearestIdx = -1;
+        for (size_t i = 0; i < supportPts.size(); ++i)
+        {
+            float dx = static_cast<float>(x - supportPts[i].x);
+            float dy = static_cast<float>(y - supportPts[i].y);
+            float d2 = dx * dx + dy * dy;
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                nearestIdx = static_cast<int>(i);
+            }
+        }
+        return bestD2;
+    };
+
+    // ------------------------------------------------------------
+    // GT 支持收集：不要求和 Ω_vd mask 重合，而是在其附近搜“同一表面”的稀疏 GT 支撑
+    // 同时输出主峰纯度与峰间分离度
+    // ------------------------------------------------------------
+    auto collectGTSupportNearVDSupport = [&](const std::vector<cv::Point>& vdSupportPts) -> GTSupportResult
+    {
+        GTSupportResult res;
+
+        if (vdSupportPts.empty() || gtPoints.empty())
+            return res;
+
+        int minX = std::numeric_limits<int>::max();
+        int minY = std::numeric_limits<int>::max();
+        int maxX = 0;
+        int maxY = 0;
+        float cx = 0.0f, cy = 0.0f;
+
+        for (size_t i = 0; i < vdSupportPts.size(); ++i)
+        {
+            minX = std::min(minX, vdSupportPts[i].x);
+            minY = std::min(minY, vdSupportPts[i].y);
+            maxX = std::max(maxX, vdSupportPts[i].x);
+            maxY = std::max(maxY, vdSupportPts[i].y);
+            cx += static_cast<float>(vdSupportPts[i].x);
+            cy += static_cast<float>(vdSupportPts[i].y);
+        }
+        cx /= static_cast<float>(vdSupportPts.size());
+        cy /= static_cast<float>(vdSupportPts.size());
+
+        struct GTCandidate
+        {
+            int x;
+            int y;
+            float value;
+            float nearD2;
+            float centroidD2;
+            float weight;
+        };
+
+        for (size_t rid = 0; rid < gtSearchRadii.size(); ++rid)
+        {
+            int R = gtSearchRadii[rid];
+
+            int bx0 = std::max(0, minX - R);
+            int by0 = std::max(0, minY - R);
+            int bx1 = std::min(m_refDepthImage.cols - 1, maxX + R);
+            int by1 = std::min(m_refDepthImage.rows - 1, maxY + R);
+
+            std::vector<GTCandidate> candidates;
+            candidates.reserve(128);
+
+            for (size_t gi = 0; gi < gtPoints.size(); ++gi)
+            {
+                const GTPoint& gp = gtPoints[gi];
+                if (gp.x < bx0 || gp.x > bx1 || gp.y < by0 || gp.y > by1)
+                    continue;
+
+                int nearestIdx = -1;
+                float nearD2 = distancePointToSupport(gp.x, gp.y, vdSupportPts, nearestIdx);
+                if (nearD2 > static_cast<float>(R * R))
+                    continue;
+                if (nearestIdx < 0)
+                    continue;
+
+                const cv::Point& anchor = vdSupportPts[nearestIdx];
+                if (crossesStrongEdge(anchor.x, anchor.y, gp.x, gp.y))
+                    continue;
+
+                float dcx = static_cast<float>(gp.x) - cx;
+                float dcy = static_cast<float>(gp.y) - cy;
+                float centroidD2 = dcx * dcx + dcy * dcy;
+
+                float w = 1.0f / (1.0f + 0.25f * nearD2 + 0.05f * centroidD2);
+
+                GTCandidate c;
+                c.x = gp.x;
+                c.y = gp.y;
+                c.value = gp.value;
+                c.nearD2 = nearD2;
+                c.centroidD2 = centroidD2;
+                c.weight = w;
+                candidates.push_back(c);
+            }
+
+            if (static_cast<int>(candidates.size()) < minGtCount)
+                continue;
+
+            float minGT = std::numeric_limits<float>::infinity();
+            float maxGT = 0.0f;
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                minGT = std::min(minGT, candidates[i].value);
+                maxGT = std::max(maxGT, candidates[i].value);
+            }
+
+            if (!(std::isfinite(minGT) && std::isfinite(maxGT) && maxGT >= minGT))
+                continue;
+
+            float histStart = std::floor(minGT / gtHistBinWidth) * gtHistBinWidth;
+            float histEnd   = std::ceil((maxGT + gtHistBinWidth) / gtHistBinWidth) * gtHistBinWidth;
+            int histBins = std::max(1, static_cast<int>(std::ceil((histEnd - histStart) / gtHistBinWidth)));
+
+            std::vector<double> hist(histBins, 0.0);
+            auto toBin = [&](float v) -> int
+            {
+                int idx = static_cast<int>(std::floor((v - histStart) / gtHistBinWidth));
+                idx = std::max(0, std::min(histBins - 1, idx));
+                return idx;
+            };
+
+            double totalScore = 0.0;
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                hist[toBin(candidates[i].value)] += candidates[i].weight;
+                totalScore += candidates[i].weight;
+            }
+
+            int bestBin = 0;
+            int secondBin = -1;
+            double bestScore = hist[0];
+            double secondScore = -1.0;
+            for (int b = 1; b < histBins; ++b)
+            {
+                if (hist[b] > bestScore)
+                {
+                    secondScore = bestScore;
+                    secondBin = bestBin;
+                    bestScore = hist[b];
+                    bestBin = b;
+                }
+                else if (hist[b] > secondScore)
+                {
+                    secondScore = hist[b];
+                    secondBin = b;
+                }
+            }
+
+            float purity = (totalScore > 1e-12) ? static_cast<float>(bestScore / totalScore) : 0.0f;
+            float gap = (bestScore > 1e-12)
+                        ? static_cast<float>((bestScore - std::max(0.0, secondScore)) / bestScore)
+                        : 0.0f;
+
+            float binLow = histStart + bestBin * gtHistBinWidth;
+            float binHigh = binLow + gtHistBinWidth;
+
+            std::vector<float> peakVals;
+            std::vector<cv::Point> peakPts;
+            peakVals.reserve(candidates.size());
+            peakPts.reserve(candidates.size());
+
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                if (candidates[i].value >= binLow && candidates[i].value < binHigh)
+                {
+                    peakVals.push_back(candidates[i].value);
+                    peakPts.push_back(cv::Point(candidates[i].x, candidates[i].y));
+                }
+            }
+
+            if (static_cast<int>(peakVals.size()) < minGtCount)
+                continue;
+
+            std::vector<float> sortedPeak = peakVals;
+            std::sort(sortedPeak.begin(), sortedPeak.end());
+            float med = quantileFromSorted(sortedPeak, 0.5f);
+
+            std::vector<float> absDev;
+            absDev.reserve(sortedPeak.size());
+            for (size_t i = 0; i < sortedPeak.size(); ++i)
+                absDev.push_back(std::fabs(sortedPeak[i] - med));
+            std::sort(absDev.begin(), absDev.end());
+            float mad = quantileFromSorted(absDev, 0.5f);
+            float tol = std::max(gtMadAbsTol, 3.0f * std::max(mad, 1.0f));
+
+            std::vector<float> finalVals;
+            std::vector<cv::Point> finalPts;
+            finalVals.reserve(peakVals.size());
+            finalPts.reserve(peakPts.size());
+
+            for (size_t i = 0; i < peakVals.size(); ++i)
+            {
+                if (std::fabs(peakVals[i] - med) <= tol)
+                {
+                    finalVals.push_back(peakVals[i]);
+                    finalPts.push_back(peakPts[i]);
+                }
+            }
+
+            if (static_cast<int>(finalVals.size()) >= minGtCount)
+            {
+                res.ok = true;
+                res.vals.swap(finalVals);
+                res.pts.swap(finalPts);
+                res.purity = purity;
+                res.gap = gap;
+                res.usedRadius = R;
+                return res;
+            }
+        }
+
+        return res;
+    };
+
+    cv::Mat debugVis = focusImage.clone();
+
+    int rejectSupportTooSmall = 0;
+    int rejectNoGTSupport = 0;
+    int rejectEdgeCross = 0;
+    int rejectWeakTexture = 0;
+    int rejectSupportEdge = 0;
+    int rejectAmbiguousGT = 0;
+
+    // ------------------------------------------------------------
+    // Step 3: seed -> support -> GT support -> representative pair
+    // ------------------------------------------------------------
+    for (size_t i = 0; i < selectedSeeds.size(); ++i)
+    {
+        const VDCandidate& seed = selectedSeeds[i];
+
+        float band = std::max(supportBandAbsMin,
+                              supportBandMadScale * std::max(seed.vdMad, supportMinMadFloor));
+
+        struct Neighbor
+        {
+            int x;
+            int y;
+            float vd;
+            float dist2;
+        };
+
+        std::vector<Neighbor> neighbors;
+        neighbors.reserve((2 * supportSearchRadius + 1) * (2 * supportSearchRadius + 1));
+
+        int x0 = std::max(0, seed.x - supportSearchRadius);
+        int x1 = std::min(m_virtualDepthImage.cols - 1, seed.x + supportSearchRadius);
+        int y0 = std::max(0, seed.y - supportSearchRadius);
+        int y1 = std::min(m_virtualDepthImage.rows - 1, seed.y + supportSearchRadius);
+
+        for (int y = y0; y <= y1; ++y)
+        {
+            for (int x = x0; x <= x1; ++x)
+            {
+                float v = m_virtualDepthImage.at<float>(y, x);
+                if (!isValidValue(v))
+                    continue;
+                if (std::fabs(v - seed.vdMedian) > band)
+                    continue;
+
+                if (crossesStrongEdge(seed.x, seed.y, x, y))
+                {
+                    ++rejectEdgeCross;
+                    continue;
+                }
+
+                float d2 = static_cast<float>((x - seed.x) * (x - seed.x) + (y - seed.y) * (y - seed.y));
+                Neighbor n;
+                n.x = x;
+                n.y = y;
+                n.vd = v;
+                n.dist2 = d2;
+                neighbors.push_back(n);
+            }
+        }
+
+        if (neighbors.empty())
+        {
+            ++rejectSupportTooSmall;
+            continue;
+        }
+
+        std::sort(neighbors.begin(), neighbors.end(),
+                  [](const Neighbor& a, const Neighbor& b)
+                  {
+                      return a.dist2 < b.dist2;
+                  });
+
+        std::vector<cv::Point> supportPts;
+        std::vector<float> supportVDVals;
+        std::vector<float> supportGrayVals;
+        float sumCorner = 0.0f;
+        int edgeCount = 0;
+
+        supportPts.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+        supportVDVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+        supportGrayVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+
+        for (size_t k = 0; k < neighbors.size() && static_cast<int>(supportPts.size()) < supportMaxPoints; ++k)
+        {
+            supportPts.push_back(cv::Point(neighbors[k].x, neighbors[k].y));
+            supportVDVals.push_back(neighbors[k].vd);
+
+            float g = static_cast<float>(guideGray.at<uchar>(neighbors[k].y, neighbors[k].x));
+            supportGrayVals.push_back(g);
+
+            sumCorner += cornerResp.at<float>(neighbors[k].y, neighbors[k].x);
+            if (guideGrad.at<float>(neighbors[k].y, neighbors[k].x) > strongEdgeThresh)
+                edgeCount++;
+        }
+
+        if (static_cast<int>(supportPts.size()) < supportMinPoints)
+        {
+            ++rejectSupportTooSmall;
+            continue;
+        }
+
+        std::sort(supportVDVals.begin(), supportVDVals.end());
+        float vdRep = quantileFromSorted(supportVDVals, 0.5f);
+
+        // 支持域自身也要有一定结构，不然这类点训练收益低、风险高
+        float supportGrayMean = 0.0f;
+        for (size_t k = 0; k < supportGrayVals.size(); ++k)
+            supportGrayMean += supportGrayVals[k];
+        supportGrayMean /= static_cast<float>(supportGrayVals.size());
+
+        float supportGrayStd = 0.0f;
+        for (size_t k = 0; k < supportGrayVals.size(); ++k)
+        {
+            float d = supportGrayVals[k] - supportGrayMean;
+            supportGrayStd += d * d;
+        }
+        supportGrayStd = std::sqrt(supportGrayStd / std::max<size_t>(1, supportGrayVals.size()));
+
+        float meanCorner = sumCorner / static_cast<float>(supportPts.size());
+        float edgeRatio = static_cast<float>(edgeCount) / static_cast<float>(supportPts.size());
+
+        if ((supportGrayMean < candidateDarkMeanReject && supportGrayStd < candidateDarkStdReject) ||
+            (supportGrayStd < supportMinGrayStd && meanCorner < supportMinCornerResp))
+        {
+            ++rejectWeakTexture;
+            continue;
+        }
+
+        if (edgeRatio > supportMaxEdgeRatio)
+        {
+            ++rejectSupportEdge;
+            continue;
+        }
+
+        GTSupportResult gtRes = collectGTSupportNearVDSupport(supportPts);
+        if (!gtRes.ok)
+        {
+            ++rejectNoGTSupport;
+            continue;
+        }
+
+        // GT 歧义过滤：主峰纯度太低、峰间差太小、或者搜得太远但纯度仍不够
+        if (gtRes.purity < minGtPeakPurity ||
+            (gtRes.gap < minGtPeakGap && gtRes.purity < 0.72f) ||
+            (gtRes.usedRadius > softMaxGtSearchRadius && gtRes.purity < 0.75f))
+        {
+            ++rejectAmbiguousGT;
+            continue;
+        }
+
+        std::sort(gtRes.vals.begin(), gtRes.vals.end());
+        float gtRep = quantileFromSorted(gtRes.vals, 0.5f);
+
+        if (!isValidValue(vdRep) || !isValidValue(gtRep))
+            continue;
+
+        SamplePoint sp;
+        sp.colIndex = seed.x;
+        sp.rowIndex = seed.y;
+        sp.vDepth = vdRep;
+        sp.gtDepth = gtRep;
+        samplePoints.push_back(sp);
+
+        // 调试可视化
+        cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2); // 红: seed
+        for (size_t k = 0; k < supportPts.size(); ++k)
+            cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);      // 黄: vd support
+        for (size_t k = 0; k < gtRes.pts.size(); ++k)
+            cv::circle(debugVis, gtRes.pts[k], 2, cv::Scalar(0, 255, 0), -1);         // 绿: gt support
+    }
+
+    std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
+              << samplePoints.size() << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportTooSmall: "
+              << rejectSupportTooSmall << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectNoGTSupport: "
+              << rejectNoGTSupport << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectEdgeCross: "
+              << rejectEdgeCross << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectWeakTexture: "
+              << rejectWeakTexture << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportEdge: "
+              << rejectSupportEdge << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectAmbiguousGT: "
+              << rejectAmbiguousGT << std::endl;
+
+    if (!debugVis.empty())
+        cv::imwrite(debugSeedPath, debugVis);
+
+    if (samplePoints.size() < static_cast<size_t>(minRepresentativePairsForFit))
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] representative pairs are too few for reliable fitting: "
+                  << samplePoints.size() << " < " << minRepresentativePairsForFit << std::endl;
+        return;
+    }
+
+    fitSegmentsParams_new(xmlPath);
+
+    cv::Mat realDepthImage = ConvertVdImageToRd(m_virtualDepthImage);
+    if (realDepthImage.empty())
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] ConvertVdImageToRd failed." << std::endl;
+        return;
+    }
+
+    SamplePointSelect();
+    errorStatisticsImageSeg(realDepthImage,
+                            m_refDepthImage,
+                            m_virtualDepthImage,
+                            focusImage,
+                            distanceImagePath);
+
+    std::cout << "[VirtualToRealDepthBySegBM_new] done." << std::endl;
+}
+
+void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
+{
+    if (samplePoints.empty())
+    {
+        std::cout << "samplePoints is empty!" << std::endl;
+        return;
+    }
+
+    // ============================================================
+    // 新思路：
+    // 1) 输入 samplePoints 中的 (gtDepth, vDepth) 已经是局部支持域上的代表值
+    // 2) 按 VD(vDepth) 分段，而不是按 GT 分段
+    // 3) 每段边界直接由该段有效样本的 vd min/max 决定
+    // 4) 拟合前后都做一次鲁棒清理
+    // 5) 对每个段增加 GT 单峰性检查，避免“同一 vd 段内 GT 多模态”
+    // ============================================================
+
+    // ---------------- 参数：可根据你的数据继续调 ----------------
+    const int   minTotalValidPairs   = 12;     // 全局最少有效样本对
+    const int   minSamplesPerSegment = 8;      // 每段最少样本数
+    const int   targetSamplesPerSeg  = 16;     // 期望每段样本数
+    const float maxVdSpanPerSegment  = 0.18f;  // 每段最大 vd 跨度
+    const float minVdSpanPerSegment  = 0.04f;  // 段太窄则不稳定
+    const float residualMadScale     = 3.0f;   // 拟合残差鲁棒阈值倍数
+    const float minResidualAbsTol    = 800.0f; // GT 残差绝对下限（单位按你的 GT，一般 mm）
+    const float segmentBoundaryEps   = 1e-4f;  // 防止 min==max
+
+    // GT 单峰性检查
+    const float gtHistBinWidth       = 2500.0f;
+    const float minGtPeakPurity      = 0.58f;
+    const float minGtPeakGap         = 0.10f;
+
+    auto isValidPair = [](const SamplePoint& p) -> bool
+    {
+        return std::isfinite(p.vDepth) && std::isfinite(p.gtDepth) &&
+               p.vDepth > 0.0f && p.gtDepth > 0.0f;
+    };
+
+    auto robustMedian = [](std::vector<float> vals) -> float
+    {
+        if (vals.empty())
+            return 0.0f;
+
+        size_t mid = vals.size() / 2;
+        std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+        float med = vals[mid];
+
+        if (vals.size() % 2 == 0)
+        {
+            float lower = *std::max_element(vals.begin(), vals.begin() + mid);
+            med = 0.5f * (lower + med);
+        }
+        return med;
+    };
+
+    auto evalBehaviorModel = [](const std::array<double, 3>& p, float vd) -> float
+    {
+        // gt = (vd * c1 + c2) / (1 - vd * c0)
+        double denom = 1.0 - static_cast<double>(vd) * p[0];
+        if (std::fabs(denom) < 1e-12)
+            return 0.0f;
+
+        double pred = (static_cast<double>(vd) * p[1] + p[2]) / denom;
+        return static_cast<float>(pred);
+    };
+
+    auto isSegmentGTUnimodal = [&](const std::vector<SamplePoint>& pts,
+                                   float& purity,
+                                   float& gap) -> bool
+    {
+        purity = 1.0f;
+        gap = 1.0f;
+
+        if (pts.size() < 3)
+            return false;
+
+        float minGT = std::numeric_limits<float>::infinity();
+        float maxGT = 0.0f;
+        for (size_t i = 0; i < pts.size(); ++i)
+        {
+            minGT = std::min(minGT, pts[i].gtDepth);
+            maxGT = std::max(maxGT, pts[i].gtDepth);
+        }
+
+        if (!(std::isfinite(minGT) && std::isfinite(maxGT) && maxGT >= minGT))
+            return false;
+
+        float histStart = std::floor(minGT / gtHistBinWidth) * gtHistBinWidth;
+        float histEnd   = std::ceil((maxGT + gtHistBinWidth) / gtHistBinWidth) * gtHistBinWidth;
+        int histBins = std::max(1, static_cast<int>(std::ceil((histEnd - histStart) / gtHistBinWidth)));
+
+        std::vector<int> hist(histBins, 0);
+
+        auto toBin = [&](float v) -> int
+        {
+            int idx = static_cast<int>(std::floor((v - histStart) / gtHistBinWidth));
+            idx = std::max(0, std::min(histBins - 1, idx));
+            return idx;
+        };
+
+        for (size_t i = 0; i < pts.size(); ++i)
+            hist[toBin(pts[i].gtDepth)]++;
+
+        int bestBin = 0;
+        int secondBin = -1;
+        int bestCount = hist[0];
+        int secondCount = -1;
+        int totalCount = 0;
+
+        for (int i = 0; i < histBins; ++i)
+            totalCount += hist[i];
+
+        for (int i = 1; i < histBins; ++i)
+        {
+            if (hist[i] > bestCount)
+            {
+                secondCount = bestCount;
+                secondBin = bestBin;
+                bestCount = hist[i];
+                bestBin = i;
+            }
+            else if (hist[i] > secondCount)
+            {
+                secondCount = hist[i];
+                secondBin = i;
+            }
+        }
+
+        purity = totalCount > 0 ? static_cast<float>(bestCount) / totalCount : 0.0f;
+        gap = bestCount > 0 ? static_cast<float>(bestCount - std::max(0, secondCount)) / bestCount : 0.0f;
+
+        return (purity >= minGtPeakPurity) && (gap >= minGtPeakGap);
+    };
+
+    // ------------------------------------------------------------
+    // 1) 收集有效样本
+    // ------------------------------------------------------------
+    std::vector<SamplePoint> validSamples;
+    validSamples.reserve(samplePoints.size());
+
+    for (size_t i = 0; i < samplePoints.size(); ++i)
+    {
+        if (isValidPair(samplePoints[i]))
+            validSamples.push_back(samplePoints[i]);
+    }
+
+    if (validSamples.size() < static_cast<size_t>(minTotalValidPairs))
+    {
+        std::cout << "Not enough valid sample pairs for fitSegmentsParams(): "
+                  << validSamples.size() << " < " << minTotalValidPairs << std::endl;
+        return;
+    }
+
+    // 按 vd 升序排列
+    std::sort(validSamples.begin(), validSamples.end(),
+              [](const SamplePoint& a, const SamplePoint& b)
+              {
+                  return a.vDepth < b.vDepth;
+              });
+
+    // ------------------------------------------------------------
+    // 2) 在 vd 域做贪心分段
+    // ------------------------------------------------------------
+    std::vector<std::vector<SamplePoint> > rawSegments;
+    rawSegments.clear();
+
+    std::vector<SamplePoint> curSeg;
+    curSeg.reserve(targetSamplesPerSeg);
+
+    for (size_t i = 0; i < validSamples.size(); ++i)
+    {
+        if (curSeg.empty())
+        {
+            curSeg.push_back(validSamples[i]);
+            continue;
+        }
+
+        float curMinVD = curSeg.front().vDepth;
+        float nextVD   = validSamples[i].vDepth;
+        float newSpan  = nextVD - curMinVD;
+
+        bool shouldCut = false;
+
+        if (static_cast<int>(curSeg.size()) >= targetSamplesPerSeg &&
+            newSpan >= minVdSpanPerSegment)
+        {
+            shouldCut = true;
+        }
+
+        if (newSpan > maxVdSpanPerSegment &&
+            static_cast<int>(curSeg.size()) >= minSamplesPerSegment)
+        {
+            shouldCut = true;
+        }
+
+        if (shouldCut)
+        {
+            rawSegments.push_back(curSeg);
+            curSeg.clear();
+        }
+
+        curSeg.push_back(validSamples[i]);
+    }
+
+    if (!curSeg.empty())
+    {
+        if (!rawSegments.empty() &&
+            static_cast<int>(curSeg.size()) < minSamplesPerSegment)
+        {
+            rawSegments.back().insert(rawSegments.back().end(), curSeg.begin(), curSeg.end());
+        }
+        else
+        {
+            rawSegments.push_back(curSeg);
+        }
+    }
+
+    // 再做一次“太碎小段并入前段”
+    {
+        std::vector<std::vector<SamplePoint> > merged;
+        for (size_t i = 0; i < rawSegments.size(); ++i)
+        {
+            if (rawSegments[i].empty())
+                continue;
+
+            if (merged.empty())
+            {
+                merged.push_back(rawSegments[i]);
+                continue;
+            }
+
+            if (static_cast<int>(rawSegments[i].size()) < minSamplesPerSegment)
+            {
+                merged.back().insert(merged.back().end(),
+                                     rawSegments[i].begin(),
+                                     rawSegments[i].end());
+            }
+            else
+            {
+                merged.push_back(rawSegments[i]);
+            }
+        }
+        rawSegments.swap(merged);
+    }
+
+    if (rawSegments.empty())
+    {
+        std::cout << "No vd-domain segments built." << std::endl;
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 3) 对每段做：
+    //    GT 单峰性检查 -> 初拟合 -> 残差清理 -> 再拟合
+    // ------------------------------------------------------------
+    std::vector<BehaviorSegmentResult> segment_results;
+    segment_results.clear();
+
+    for (size_t s = 0; s < rawSegments.size(); ++s)
+    {
+        std::vector<SamplePoint>& segPts = rawSegments[s];
+        if (segPts.size() < 3)
+            continue;
+
+        float gtPurity = 1.0f;
+        float gtGap = 1.0f;
+        if (!isSegmentGTUnimodal(segPts, gtPurity, gtGap))
+        {
+            std::cout << "[fitSegmentsParams] skip ambiguous segment " << s
+                      << "  sampleCount=" << segPts.size()
+                      << "  gtPurity=" << gtPurity
+                      << "  gtGap=" << gtGap << std::endl;
+            continue;
+        }
+
+        // ---- 3.1 第一次拟合 ----
+        std::vector<float> gtVals;
+        std::vector<float> vdVals;
+        gtVals.reserve(segPts.size());
+        vdVals.reserve(segPts.size());
+
+        for (size_t i = 0; i < segPts.size(); ++i)
+        {
+            gtVals.push_back(segPts[i].gtDepth);
+            vdVals.push_back(segPts[i].vDepth);
+        }
+
+        if (gtVals.size() < 3)
+            continue;
+
+        std::array<double, 3> params = BehavioralModel(gtVals, vdVals);
+
+        // ---- 3.2 按残差做一次鲁棒清理 ----
+        std::vector<float> residuals;
+        residuals.reserve(segPts.size());
+
+        for (size_t i = 0; i < segPts.size(); ++i)
+        {
+            float pred = evalBehaviorModel(params, segPts[i].vDepth);
+            float res  = std::fabs(pred - segPts[i].gtDepth);
+            residuals.push_back(res);
+        }
+
+        float medRes = robustMedian(residuals);
+
+        std::vector<float> absDev;
+        absDev.reserve(residuals.size());
+        for (size_t i = 0; i < residuals.size(); ++i)
+            absDev.push_back(std::fabs(residuals[i] - medRes));
+
+        float madRes = robustMedian(absDev);
+        float resTol = std::max(minResidualAbsTol,
+                                residualMadScale * std::max(madRes, 1.0f));
+
+        std::vector<SamplePoint> inliers;
+        inliers.reserve(segPts.size());
+
+        for (size_t i = 0; i < segPts.size(); ++i)
+        {
+            if (residuals[i] <= resTol)
+                inliers.push_back(segPts[i]);
+        }
+
+        // 清理后太少，则放弃该段
+        if (inliers.size() < static_cast<size_t>(minSamplesPerSegment))
+        {
+            std::cout << "[fitSegmentsParams] skip weak segment " << s
+                      << " after residual filtering, inliers=" << inliers.size() << std::endl;
+            continue;
+        }
+
+        // 再做一次 GT 单峰性检查，防止 residual 清理后段内形态变化
+        gtPurity = 1.0f;
+        gtGap = 1.0f;
+        if (!isSegmentGTUnimodal(inliers, gtPurity, gtGap))
+        {
+            std::cout << "[fitSegmentsParams] skip ambiguous segment " << s
+                      << " after residual filtering"
+                      << "  inliers=" << inliers.size()
+                      << "  gtPurity=" << gtPurity
+                      << "  gtGap=" << gtGap << std::endl;
+            continue;
+        }
+
+        // ---- 3.3 再拟合一次 ----
+        gtVals.clear();
+        vdVals.clear();
+        gtVals.reserve(inliers.size());
+        vdVals.reserve(inliers.size());
+
+        for (size_t i = 0; i < inliers.size(); ++i)
+        {
+            gtVals.push_back(inliers[i].gtDepth);
+            vdVals.push_back(inliers[i].vDepth);
+        }
+
+        if (gtVals.size() < 3)
+            continue;
+
+        params = BehavioralModel(gtVals, vdVals);
+
+        // ---- 3.4 真实段边界：直接来自本段 vd min/max ----
+        float vdMin = std::numeric_limits<float>::infinity();
+        float vdMax = 0.0f;
+
+        for (size_t i = 0; i < inliers.size(); ++i)
+        {
+            vdMin = std::min(vdMin, inliers[i].vDepth);
+            vdMax = std::max(vdMax, inliers[i].vDepth);
+        }
+
+        if (!(std::isfinite(vdMin) && std::isfinite(vdMax) && vdMax > vdMin))
+            continue;
+
+        BehaviorSegmentResult seg;
+        seg.vdepthMin = vdMin;
+        seg.vdepthMax = vdMax;
+        seg.sampleCount = static_cast<int>(inliers.size());
+        seg.params = params;
+        segment_results.push_back(seg);
+
+        std::cout << "[fitSegmentsParams] keep segment " << s
+                  << "  vd=[" << vdMin << ", " << vdMax << "]"
+                  << "  sampleCount=" << inliers.size()
+                  << "  gtPurity=" << gtPurity
+                  << "  gtGap=" << gtGap
+                  << "  params=(" << params[0] << ", "
+                                  << params[1] << ", "
+                                  << params[2] << ")"
+                  << std::endl;
+    }
+
+    if (segment_results.empty())
+    {
+        std::cout << "No valid fitted segments." << std::endl;
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 4) 段边界排序 + 中点拼接，避免缝隙与重叠
+    // ------------------------------------------------------------
+    std::sort(segment_results.begin(), segment_results.end(),
+              [](const BehaviorSegmentResult& a, const BehaviorSegmentResult& b)
+              {
+                  return a.vdepthMin < b.vdepthMin;
+              });
+
+    for (size_t i = 1; i < segment_results.size(); ++i)
+    {
+        float leftMax  = segment_results[i - 1].vdepthMax;
+        float rightMin = segment_results[i].vdepthMin;
+        float mid = 0.5f * (leftMax + rightMin);
+
+        segment_results[i - 1].vdepthMax = mid;
+        segment_results[i].vdepthMin = mid;
+    }
+
+    for (size_t i = 0; i < segment_results.size(); ++i)
+    {
+        if (segment_results[i].vdepthMax <= segment_results[i].vdepthMin)
+        {
+            segment_results[i].vdepthMax = segment_results[i].vdepthMin + segmentBoundaryEps;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 5) 写 XML
+    // ------------------------------------------------------------
+    std::ofstream xml(xml_path.c_str());
+    if (!xml.is_open())
+    {
+        std::cerr << "无法写入 XML: " << xml_path << std::endl;
+        return;
+    }
+
+    xml << std::fixed << std::setprecision(6);
+    xml << "<?xml version=\"1.0\"?>\n";
+    xml << "<opencv_storage>\n";
+    xml << "    <BehaviorModelSegments>\n\n";
+
+    for (size_t i = 0; i < segment_results.size(); ++i)
+    {
+        const BehaviorSegmentResult& seg = segment_results[i];
+
+        xml << "        <Segment>\n";
+        xml << "            <DepthMin>" << seg.vdepthMin << "</DepthMin>\n";
+        xml << "            <DepthMax>" << seg.vdepthMax << "</DepthMax>\n";
+        xml << "            <SampleCount>" << seg.sampleCount << "</SampleCount>\n\n";
+        xml << "            <Param>\n";
+        xml << "                <c0>" << seg.params[0] << "</c0>\n";
+        xml << "                <c1>" << seg.params[1] << "</c1>\n";
+        xml << "                <c2>" << seg.params[2] << "</c2>\n";
+        xml << "            </Param>\n";
+        xml << "        </Segment>\n\n";
+
+        std::cout << "[fitSegmentsParams] Segment " << i
+                  << "  vd=[" << seg.vdepthMin << ", " << seg.vdepthMax << "]"
+                  << "  sampleCount=" << seg.sampleCount
+                  << "  params=(" << seg.params[0] << ", "
+                                  << seg.params[1] << ", "
+                                  << seg.params[2] << ")"
+                  << std::endl;
+    }
+
+    xml << "    </BehaviorModelSegments>\n";
+    xml << "</opencv_storage>\n";
+    xml.close();
+
+    std::cout << "Behavior model XML saved: " << xml_path << std::endl;
+}
     void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_2()
     {
         m_strRootPath = m_ptrDepthSolver->GetRootPath();
