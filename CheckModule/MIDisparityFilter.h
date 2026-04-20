@@ -1,9 +1,9 @@
-
 /********************************************************************
 file base:      MIDisparityFilter.h
 author:         LZD
 created:        2026/04/10
-purpose:        基于闭环一致性与局部连续性的视差噪点剔除
+purpose:        基于闭环一致性与局部连续性的视差噪点剔除，
+                并在 FilterGlobal() 后输出整张光场影像级别的重投影误差图
 *********************************************************************/
 #ifndef MIDISPARITYFILTER_H
 #define MIDISPARITYFILTER_H
@@ -49,12 +49,11 @@ namespace LFMVS
 
         bool  dump_debug_mask = true;
 
-        // 4) 一致性误差图（重投影/闭环几何误差）输出
-        // 注意：这里不是 GT 真误差，而是跨视图闭环重投影误差的一致性度量
-        bool  dump_disp_error_map   = false;
-        float disp_error_thresh_px  = 0.5f;     // 可视化阈值/通过阈值
-        float disp_error_vis_max_px = 2.0f;     // 热图固定色条上限
-        float disp_error_png_scale  = 1000.0f;  // 16-bit png 编码比例: err_px * scale
+        // 4) 整张光场影像级别的一致性误差图（重投影误差）
+        // 说明：这里不是 GT 真误差，而是 FilterGlobal() 中闭环几何重投影误差的整图输出。
+        bool  dump_disp_error_map = true;
+        float disp_error_thresh_px  = 0.5f; // 色条阈值标线 / pass mask 阈值
+        float disp_error_vis_max_px = 2.0f; // 整图只保留 <= 该值的误差；同时也是热图色条上限
     };
 
     struct MIDisparityFilterStats
@@ -69,7 +68,7 @@ namespace LFMVS
         int64_t removed_by_cycle = 0;
         int64_t removed_by_spike = 0;
 
-        // 一致性误差图统计（基于 geo reprojection error）
+        // 整图重投影误差统计（仅统计最终保留且 <= disp_error_vis_max_px 的像素）
         int64_t num_disp_error_samples = 0;
         int64_t num_disp_error_le_thresh = 0;
         double  mean_disp_error_px = 0.0;
@@ -125,6 +124,22 @@ namespace LFMVS
             MIDisparityFilterStats& io_stats,
             const std::string& save_root) const;
 
+        void ComputeTileReprojectionErrorMap(
+            const TileInputs& in,
+            const QuadTreeDisNormalMap& dis_normals,
+            const DisparityAndNormalPtr& ptrDN,
+            const MIDisparityFilterConfig& cfg,
+            cv::Mat& out_err_map) const;
+
+        void DumpWholeFrameReprojectionError(
+            const std::string& frameName,
+            const QuadTreeTileInfoMap& MLA_info_map,
+            const QuadTreeProblemMap& problems_map,
+            const QuadTreeDisNormalMap& dis_normals,
+            const MIDisparityFilterConfig& cfg,
+            MIDisparityFilterStats& io_stats,
+            const std::string& save_root) const;
+
         static void EnumerateSetBits(unsigned int mask, std::vector<int>& out_ids, int max_needed);
         static bool BilinearSampleF32(const cv::Mat& img, float x, float y, float& v);
         static float QuantileFromSorted(const std::vector<float>& sorted_vals, float q);
@@ -136,9 +151,9 @@ namespace LFMVS
         void InvalidatePixel(const DisparityAndNormalPtr& ptrDN, int idx, bool clear_selected_views) const;
         void DumpMask(const std::string& path, const cv::Mat& reason_mask) const;
 
-        static void DumpDispErrorGray16PNG(const std::string& path,
-                                           const cv::Mat& err_f32,
-                                           float scale);
+        static void DumpDispErrorGrayPNG(const std::string& path,
+                                         const cv::Mat& err_f32,
+                                         float vis_max_px);
         static void DumpDispErrorPassMask(const std::string& path,
                                           const cv::Mat& err_f32,
                                           float thresh_px);
