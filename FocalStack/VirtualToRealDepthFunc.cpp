@@ -155,6 +155,13 @@ namespace LFMVS {
             int cellId;
         };
 
+        struct GTPoint
+        {
+            int x;
+            int y;
+            float value;
+        };
+
         auto isValidValue = [](float v) -> bool
         {
             return std::isfinite(v) && v > 0.0f;
@@ -252,6 +259,29 @@ namespace LFMVS {
                 guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
         }
 
+        // ------------------------------------------------------------
+        // 预提取所有有效 GT 点
+        // ------------------------------------------------------------
+        std::vector<GTPoint> gtPoints;
+        gtPoints.reserve(10000);
+        for (int y = 0; y < m_refDepthImage.rows; ++y)
+        {
+            for (int x = 0; x < m_refDepthImage.cols; ++x)
+            {
+                float gv = m_refDepthImage.at<float>(y, x);
+                if (isValidValue(gv))
+                {
+                    GTPoint p;
+                    p.x = x;
+                    p.y = y;
+                    p.value = gv;
+                    gtPoints.push_back(p);
+                }
+            }
+        }
+        std::cout << "[VirtualToRealDepthBySegBM_new] valid GT points: "
+                  << gtPoints.size() << std::endl;
+
         const int   candidateStride        = 3;
         const int   candidatePatchRadius   = 2;
         const int   candidateMinCount      = 4;
@@ -269,11 +299,15 @@ namespace LFMVS {
         const float supportBandAbsMin      = 0.03f;
         const float supportBandMadScale    = 3.0f;
         const float supportMinMadFloor     = 0.005f;
+
         const float strongEdgeThresh       = 55.0f;
         const float maxGrayJump            = 28.0f;
-        const int   gtSearchRadius         = 3;
-        const int   minGtCount             = 2;
-        const float gtMadAbsTol            = 800.0f;
+
+        // GT 支持不再用固定 3px mask 重叠，而是逐级扩展搜索
+        const std::vector<int> gtSearchRadii = {6, 12, 20, 30};
+        const int   minGtCount             = 3;
+        const float gtMadAbsTol            = 1200.0f;
+        const float gtHistBinWidth         = 2000.0f;  // 单位按你的 GT 图（大概率 mm）
 
         auto cellIdOf = [&](int x, int y) -> int
         {
@@ -374,6 +408,7 @@ namespace LFMVS {
         std::vector<VDCandidate> selectedSeeds;
         selectedSeeds.reserve(vdBinCount * seedsPerBin);
         std::vector<cv::Point> selectedSeedPts;
+
         auto isFarEnough = [&](int x, int y, int minDistPx) -> bool
         {
             for (size_t i = 0; i < selectedSeedPts.size(); ++i)
@@ -391,11 +426,11 @@ namespace LFMVS {
             if (bins[b].candidates.empty())
                 continue;
 
-            std::map<int, std::vector<VDCandidate> > byCell;
+            std::map<int, std::vector<VDCandidate>> byCell;
             for (size_t i = 0; i < bins[b].candidates.size(); ++i)
                 byCell[bins[b].candidates[i].cellId].push_back(bins[b].candidates[i]);
 
-            for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
+            for (std::map<int, std::vector<VDCandidate>>::iterator it = byCell.begin(); it != byCell.end(); ++it)
             {
                 std::sort(it->second.begin(), it->second.end(),
                           [](const VDCandidate& a, const VDCandidate& b)
@@ -408,7 +443,7 @@ namespace LFMVS {
             }
 
             std::vector<int> cellOrder;
-            for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
+            for (std::map<int, std::vector<VDCandidate>>::iterator it = byCell.begin(); it != byCell.end(); ++it)
                 cellOrder.push_back(it->first);
             std::sort(cellOrder.begin(), cellOrder.end());
 
@@ -455,6 +490,8 @@ namespace LFMVS {
             if (steps <= 1)
                 return false;
 
+            float prevGray = static_cast<float>(guideGray.at<uchar>(y0, x0));
+
             for (int s = 1; s < steps; ++s)
             {
                 float t = static_cast<float>(s) / static_cast<float>(steps);
@@ -462,85 +499,228 @@ namespace LFMVS {
                 int y = static_cast<int>(std::round((1.0f - t) * y0 + t * y1));
                 x = std::max(0, std::min(guideGrad.cols - 1, x));
                 y = std::max(0, std::min(guideGrad.rows - 1, y));
-                if (guideGrad.at<float>(y, x) > strongEdgeThresh)
+
+                float g = guideGrad.at<float>(y, x);
+                float curGray = static_cast<float>(guideGray.at<uchar>(y, x));
+                float dGray = std::fabs(curGray - prevGray);
+
+                if (g > strongEdgeThresh && dGray > maxGrayJump)
                     return true;
+
+                prevGray = curGray;
             }
             return false;
         };
 
-        auto collectGTSupport = [&](const std::vector<cv::Point>& vdSupportPts,
-                                    std::vector<float>& gtVals) -> bool
+        auto distancePointToSupport = [&](int x, int y, const std::vector<cv::Point>& supportPts, int& nearestIdx) -> float
+        {
+            float bestD2 = std::numeric_limits<float>::infinity();
+            nearestIdx = -1;
+            for (size_t i = 0; i < supportPts.size(); ++i)
+            {
+                float dx = static_cast<float>(x - supportPts[i].x);
+                float dy = static_cast<float>(y - supportPts[i].y);
+                float d2 = dx * dx + dy * dy;
+                if (d2 < bestD2)
+                {
+                    bestD2 = d2;
+                    nearestIdx = static_cast<int>(i);
+                }
+            }
+            return bestD2;
+        };
+
+        auto collectGTSupportNearVDSupport = [&](const std::vector<cv::Point>& vdSupportPts,
+                                                 std::vector<float>& gtVals,
+                                                 std::vector<cv::Point>& gtSupportPts) -> bool
         {
             gtVals.clear();
-            std::set<std::pair<int, int> > used;
+            gtSupportPts.clear();
+
+            if (vdSupportPts.empty() || gtPoints.empty())
+                return false;
+
+            // 1) VD 支持域几何摘要
+            int minX = std::numeric_limits<int>::max();
+            int minY = std::numeric_limits<int>::max();
+            int maxX = 0;
+            int maxY = 0;
+            float cx = 0.0f, cy = 0.0f;
 
             for (size_t i = 0; i < vdSupportPts.size(); ++i)
             {
-                int cx = vdSupportPts[i].x;
-                int cy = vdSupportPts[i].y;
+                minX = std::min(minX, vdSupportPts[i].x);
+                minY = std::min(minY, vdSupportPts[i].y);
+                maxX = std::max(maxX, vdSupportPts[i].x);
+                maxY = std::max(maxY, vdSupportPts[i].y);
+                cx += static_cast<float>(vdSupportPts[i].x);
+                cy += static_cast<float>(vdSupportPts[i].y);
+            }
+            cx /= static_cast<float>(vdSupportPts.size());
+            cy /= static_cast<float>(vdSupportPts.size());
 
-                float bestDist2 = std::numeric_limits<float>::infinity();
-                float bestVal = 0.0f;
-                int bestX = -1, bestY = -1;
+            struct GTCandidate
+            {
+                int x;
+                int y;
+                float value;
+                float nearD2;
+                float centroidD2;
+                float weight;
+            };
 
-                for (int dy = -gtSearchRadius; dy <= gtSearchRadius; ++dy)
+            // 2) 逐级扩大搜索范围，在 Ω_vd 附近找 GT 稀疏支撑
+            for (size_t rid = 0; rid < gtSearchRadii.size(); ++rid)
+            {
+                int R = gtSearchRadii[rid];
+
+                int bx0 = std::max(0, minX - R);
+                int by0 = std::max(0, minY - R);
+                int bx1 = std::min(m_refDepthImage.cols - 1, maxX + R);
+                int by1 = std::min(m_refDepthImage.rows - 1, maxY + R);
+
+                std::vector<GTCandidate> candidates;
+                candidates.reserve(128);
+
+                for (size_t gi = 0; gi < gtPoints.size(); ++gi)
                 {
-                    for (int dx = -gtSearchRadius; dx <= gtSearchRadius; ++dx)
+                    const GTPoint& gp = gtPoints[gi];
+
+                    if (gp.x < bx0 || gp.x > bx1 || gp.y < by0 || gp.y > by1)
+                        continue;
+
+                    int nearestIdx = -1;
+                    float nearD2 = distancePointToSupport(gp.x, gp.y, vdSupportPts, nearestIdx);
+
+                    // 和 VD 支持域至少要“附近”
+                    if (nearD2 > static_cast<float>(R * R))
+                        continue;
+
+                    if (nearestIdx < 0)
+                        continue;
+
+                    // AIF 只做边界阻断：从最近 support 点到 GT 点之间不能跨强边界
+                    const cv::Point& anchor = vdSupportPts[nearestIdx];
+                    if (crossesStrongEdge(anchor.x, anchor.y, gp.x, gp.y))
+                        continue;
+
+                    float dcx = static_cast<float>(gp.x) - cx;
+                    float dcy = static_cast<float>(gp.y) - cy;
+                    float centroidD2 = dcx * dcx + dcy * dcy;
+
+                    // 权重：越靠近 support / centroid 越大
+                    float w = 1.0f / (1.0f + 0.25f * nearD2 + 0.05f * centroidD2);
+
+                    GTCandidate c;
+                    c.x = gp.x;
+                    c.y = gp.y;
+                    c.value = gp.value;
+                    c.nearD2 = nearD2;
+                    c.centroidD2 = centroidD2;
+                    c.weight = w;
+                    candidates.push_back(c);
+                }
+
+                if (static_cast<int>(candidates.size()) < minGtCount)
+                    continue;
+
+                // 3) 用加权直方图找 GT 主峰，避免混入前景/背景
+                float minGT = std::numeric_limits<float>::infinity();
+                float maxGT = 0.0f;
+                for (size_t i = 0; i < candidates.size(); ++i)
+                {
+                    minGT = std::min(minGT, candidates[i].value);
+                    maxGT = std::max(maxGT, candidates[i].value);
+                }
+
+                if (!(std::isfinite(minGT) && std::isfinite(maxGT) && maxGT >= minGT))
+                    continue;
+
+                float histStart = std::floor(minGT / gtHistBinWidth) * gtHistBinWidth;
+                float histEnd   = std::ceil((maxGT + gtHistBinWidth) / gtHistBinWidth) * gtHistBinWidth;
+                int histBins = std::max(1, static_cast<int>(std::ceil((histEnd - histStart) / gtHistBinWidth)));
+
+                std::vector<double> hist(histBins, 0.0);
+                auto toBin = [&](float v) -> int
+                {
+                    int idx = static_cast<int>(std::floor((v - histStart) / gtHistBinWidth));
+                    idx = std::max(0, std::min(histBins - 1, idx));
+                    return idx;
+                };
+
+                for (size_t i = 0; i < candidates.size(); ++i)
+                {
+                    hist[toBin(candidates[i].value)] += candidates[i].weight;
+                }
+
+                int bestBin = 0;
+                double bestScore = hist[0];
+                for (int b = 1; b < histBins; ++b)
+                {
+                    if (hist[b] > bestScore)
                     {
-                        int x = cx + dx;
-                        int y = cy + dy;
-                        if (x < 0 || x >= m_refDepthImage.cols || y < 0 || y >= m_refDepthImage.rows)
-                            continue;
-                        float gv = m_refDepthImage.at<float>(y, x);
-                        if (!isValidValue(gv))
-                            continue;
-                        float d2 = static_cast<float>(dx * dx + dy * dy);
-                        if (d2 < bestDist2)
-                        {
-                            bestDist2 = d2;
-                            bestVal = gv;
-                            bestX = x;
-                            bestY = y;
-                        }
+                        bestScore = hist[b];
+                        bestBin = b;
                     }
                 }
 
-                if (bestX >= 0)
+                float binLow = histStart + bestBin * gtHistBinWidth;
+                float binHigh = binLow + gtHistBinWidth;
+                float binCenter = 0.5f * (binLow + binHigh);
+
+                std::vector<float> peakVals;
+                std::vector<cv::Point> peakPts;
+                peakVals.reserve(candidates.size());
+                peakPts.reserve(candidates.size());
+
+                for (size_t i = 0; i < candidates.size(); ++i)
                 {
-                    std::pair<int, int> key(bestX, bestY);
-                    if (used.insert(key).second)
-                        gtVals.push_back(bestVal);
+                    if (candidates[i].value >= binLow && candidates[i].value < binHigh)
+                    {
+                        peakVals.push_back(candidates[i].value);
+                        peakPts.push_back(cv::Point(candidates[i].x, candidates[i].y));
+                    }
                 }
-            }
 
-            if (static_cast<int>(gtVals.size()) < minGtCount)
-                return false;
+                if (static_cast<int>(peakVals.size()) < minGtCount)
+                    continue;
 
-            if (gtVals.size() >= 3)
-            {
-                std::vector<float> sorted = gtVals;
-                std::sort(sorted.begin(), sorted.end());
-                float med = quantileFromSorted(sorted, 0.5f);
+                // 4) median + MAD 再精炼
+                std::vector<float> sortedPeak = peakVals;
+                std::sort(sortedPeak.begin(), sortedPeak.end());
+                float med = quantileFromSorted(sortedPeak, 0.5f);
+
                 std::vector<float> absDev;
-                absDev.reserve(sorted.size());
-                for (size_t i = 0; i < sorted.size(); ++i)
-                    absDev.push_back(std::fabs(sorted[i] - med));
+                absDev.reserve(sortedPeak.size());
+                for (size_t i = 0; i < sortedPeak.size(); ++i)
+                    absDev.push_back(std::fabs(sortedPeak[i] - med));
                 std::sort(absDev.begin(), absDev.end());
                 float mad = quantileFromSorted(absDev, 0.5f);
-                float tol = std::max(gtMadAbsTol, mad * 3.0f);
+                float tol = std::max(gtMadAbsTol, 3.0f * std::max(mad, 1.0f));
 
-                std::vector<float> filtered;
-                filtered.reserve(gtVals.size());
-                for (size_t i = 0; i < gtVals.size(); ++i)
+                std::vector<float> finalVals;
+                std::vector<cv::Point> finalPts;
+                finalVals.reserve(peakVals.size());
+                finalPts.reserve(peakPts.size());
+
+                for (size_t i = 0; i < peakVals.size(); ++i)
                 {
-                    if (std::fabs(gtVals[i] - med) <= tol)
-                        filtered.push_back(gtVals[i]);
+                    if (std::fabs(peakVals[i] - med) <= tol)
+                    {
+                        finalVals.push_back(peakVals[i]);
+                        finalPts.push_back(peakPts[i]);
+                    }
                 }
-                if (static_cast<int>(filtered.size()) >= minGtCount)
-                    gtVals.swap(filtered);
+
+                if (static_cast<int>(finalVals.size()) >= minGtCount)
+                {
+                    gtVals.swap(finalVals);
+                    gtSupportPts.swap(finalPts);
+                    return true;
+                }
             }
 
-            return static_cast<int>(gtVals.size()) >= minGtCount;
+            return false;
         };
 
         cv::Mat debugVis = focusImage.clone();
@@ -622,7 +802,8 @@ namespace LFMVS {
             float vdRep = quantileFromSorted(supportVDVals, 0.5f);
 
             std::vector<float> gtVals;
-            if (!collectGTSupport(supportPts, gtVals))
+            std::vector<cv::Point> gtSupportPts;
+            if (!collectGTSupportNearVDSupport(supportPts, gtVals, gtSupportPts))
             {
                 ++rejectNoGTSupport;
                 continue;
@@ -641,9 +822,12 @@ namespace LFMVS {
             sp.gtDepth = gtRep;
             samplePoints.push_back(sp);
 
-            cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2);
+            // 调试可视化
+            cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2); // 红：seed
             for (size_t k = 0; k < supportPts.size(); ++k)
-                cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);
+                cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);      // 黄：vd support
+            for (size_t k = 0; k < gtSupportPts.size(); ++k)
+                cv::circle(debugVis, gtSupportPts[k], 2, cv::Scalar(0, 255, 0), -1);       // 绿：gt support
         }
 
         std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
@@ -679,7 +863,6 @@ namespace LFMVS {
                                 m_virtualDepthImage,
                                 focusImage,
                                 distanceImagePath);
-
         std::cout << "[VirtualToRealDepthBySegBM_new] done." << std::endl;
     }
 
