@@ -155,6 +155,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         float grayMean;
         float grayStd;
         float cornerResp;
+        float gtDist;
 
         float score;
         int cellId;
@@ -186,23 +187,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         return std::isfinite(v) && v > 0.0f;
     };
 
-    auto robustMedian = [](std::vector<float> vals) -> float
-    {
-        if (vals.empty())
-            return 0.0f;
-
-        const size_t mid = vals.size() / 2;
-        std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
-        float med = vals[mid];
-
-        if (vals.size() % 2 == 0)
-        {
-            float lower = *std::max_element(vals.begin(), vals.begin() + mid);
-            med = 0.5f * (lower + med);
-        }
-        return med;
-    };
-
     auto quantileFromSorted = [](const std::vector<float>& sortedVals, float q) -> float
     {
         if (sortedVals.empty())
@@ -219,6 +203,14 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             return sortedVals[lo];
 
         return sortedVals[lo] * (1.0f - t) + sortedVals[hi] * t;
+    };
+
+    auto robustMedian = [&](std::vector<float> vals) -> float
+    {
+        if (vals.empty())
+            return 0.0f;
+        std::sort(vals.begin(), vals.end());
+        return quantileFromSorted(vals, 0.5f);
     };
 
     auto computePatchStats = [&](const cv::Mat& src,
@@ -305,7 +297,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
     }
 
-    // 结构张量最小特征值：比单纯梯度更适合筛“可匹配结构”
     cv::Mat cornerResp;
     cv::cornerMinEigenVal(guideGray, cornerResp, 3, 3);
     {
@@ -340,55 +331,75 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     std::cout << "[VirtualToRealDepthBySegBM_new] valid GT points: "
               << gtPoints.size() << std::endl;
 
+    if (gtPoints.empty())
+    {
+        std::cout << "[VirtualToRealDepthBySegBM_new] no valid GT points." << std::endl;
+        return;
+    }
+
     // ------------------------------------------------------------
-    // 参数
+    // GT 距离图：任意像素到最近 GT 有效点的距离
     // ------------------------------------------------------------
-    const int   candidateStride        = 3;
-    const int   candidatePatchRadius   = 2;
-    const int   texturePatchRadius     = 3;
-    const int   candidateMinCount      = 4;
+    cv::Mat gtValidMask = cv::Mat::zeros(m_refDepthImage.size(), CV_8UC1);
+    for (size_t i = 0; i < gtPoints.size(); ++i)
+    {
+        gtValidMask.at<uchar>(gtPoints[i].y, gtPoints[i].x) = 255;
+    }
 
-    const float candidateMaxMad        = 0.045f;
-    const float candidateMaxSpan       = 0.18f;
-    const float candidateMaxGrad       = 95.0f;
+    cv::Mat invGtMask;
+    cv::bitwise_not(gtValidMask, invGtMask);
 
-    // 新增：前端纹理/结构筛选
-    const float candidateDarkMeanReject = 35.0f;
-    const float candidateDarkStdReject  = 14.0f;
-    const float candidateMinGrayStd     = 8.0f;
-    const float candidateMinCornerResp  = 6.0f;
+    cv::Mat gtDistMap;
+    cv::distanceTransform(invGtMask, gtDistMap, cv::DIST_L2, 3);
+    gtDistMap.convertTo(gtDistMap, CV_32F);
 
-    const int   gridCols               = 6;
-    const int   gridRows               = 6;
-    const int   seedsPerBin            = 18;
-    const int   vdBinCount             = 8;
+    // ------------------------------------------------------------
+    // 参数：这一版先放松一档，让流程先跑起来
+    // ------------------------------------------------------------
+    const int   candidateStride         = 2;
+    const int   candidatePatchRadius    = 2;
+    const int   texturePatchRadius      = 2;
+    const int   candidateMinCount       = 3;
 
-    const int   supportSearchRadius    = 10;
-    const int   supportMaxPoints       = 12;
-    const int   supportMinPoints       = 4;
-    const float supportBandAbsMin      = 0.03f;
-    const float supportBandMadScale    = 3.0f;
-    const float supportMinMadFloor     = 0.005f;
+    const float candidateMaxMad         = 0.080f;
+    const float candidateMaxSpan        = 0.300f;
+    const float candidateMaxGrad        = 140.0f;
 
-    const float strongEdgeThresh       = 55.0f;
-    const float maxGrayJump            = 28.0f;
+    const float candidateDarkMeanReject = 22.0f;
+    const float candidateDarkStdReject  = 6.0f;
+    const float candidateMinGrayStd     = 3.0f;
+    const float candidateMinCornerResp  = 1.5f;
+    const float candidateMaxGtDist      = 24.0f;
 
-    // 支持域额外约束
-    const float supportMinGrayStd      = 8.0f;
-    const float supportMinCornerResp   = 6.0f;
-    const float supportMaxEdgeRatio    = 0.35f;
+    const int   gridCols                = 6;
+    const int   gridRows                = 6;
+    const int   seedsPerBin             = 24;
+    const int   vdBinCount              = 8;
 
-    // GT 支持：邻域搜索 + 主峰纯度
-    const std::vector<int> gtSearchRadii = {6, 12, 20, 30};
-    const int   minGtCount             = 3;
-    const float gtMadAbsTol            = 1200.0f;
-    const float gtHistBinWidth         = 2000.0f;
+    const int   supportSearchRadius     = 12;
+    const int   supportMaxPoints        = 12;
+    const int   supportMinPoints        = 3;
+    const float supportBandAbsMin       = 0.04f;
+    const float supportBandMadScale     = 3.5f;
+    const float supportMinMadFloor      = 0.006f;
 
-    const float minGtPeakPurity        = 0.55f;
-    const float minGtPeakGap           = 0.08f;
-    const int   softMaxGtSearchRadius  = 20;
+    const float strongEdgeThresh        = 55.0f;
+    const float maxGrayJump             = 28.0f;
 
-    const int   minRepresentativePairsForFit = 12;
+    const float supportMinGrayStd       = 4.0f;
+    const float supportMinCornerResp    = 1.5f;
+    const float supportMaxEdgeRatio     = 0.55f;
+
+    const std::vector<int> gtSearchRadii = {8, 16, 28, 40, 56};
+    const int   minGtCount              = 2;
+    const float gtMadAbsTol             = 1800.0f;
+    const float gtHistBinWidth          = 2500.0f;
+
+    const float minGtPeakPurity         = 0.45f;
+    const float minGtPeakGap            = 0.04f;
+    const int   softMaxGtSearchRadius   = 40;
+
+    const int   minRepresentativePairsForFit = 6;
 
     auto cellIdOf = [&](int x, int y) -> int
     {
@@ -400,7 +411,8 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     };
 
     // ------------------------------------------------------------
-    // Step 1: VD 候选池（加入纹理/结构筛选）
+    // Step 1: VD 候选池
+    // 加入 GT 距离约束，避免 seed 落在 GT 根本支撑不到的区域
     // ------------------------------------------------------------
     std::vector<VDCandidate> candidatePool;
     candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
@@ -434,24 +446,26 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
                 continue;
 
             float corner = cornerResp.at<float>(y, x);
+            float gtDist = gtDistMap.at<float>(y, x);
 
-            // VD 本身先要稳
+            if (gtDist > candidateMaxGtDist)
+                continue;
+
             if (mad > candidateMaxMad) continue;
             if (span > candidateMaxSpan) continue;
             if (grad > candidateMaxGrad) continue;
 
-            // 新增：暗弱纹理区尽量不要
             if (grayMean < candidateDarkMeanReject && grayStd < candidateDarkStdReject)
                 continue;
 
-            // 新增：平坦/单调弱结构区尽量不要
             if (grayStd < candidateMinGrayStd && corner < candidateMinCornerResp)
                 continue;
 
             float texturePenalty = 0.0f;
-            if (grayStd < 14.0f) texturePenalty += (14.0f - grayStd) * 0.10f;
-            if (corner < 10.0f) texturePenalty += (10.0f - corner) * 0.08f;
-            if (grayMean < 40.0f) texturePenalty += (40.0f - grayMean) * 0.02f;
+            if (grayStd < 10.0f) texturePenalty += (10.0f - grayStd) * 0.05f;
+            if (corner < 6.0f)   texturePenalty += (6.0f - corner) * 0.04f;
+            if (grayMean < 30.0f) texturePenalty += (30.0f - grayMean) * 0.01f;
+            texturePenalty += gtDist * 0.06f;
 
             VDCandidate c;
             c.x = x;
@@ -465,7 +479,8 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             c.grayMean = grayMean;
             c.grayStd = grayStd;
             c.cornerResp = corner;
-            c.score = mad * 8.0f + span * 4.0f + grad * 0.02f + texturePenalty;
+            c.gtDist = gtDist;
+            c.score = mad * 6.0f + span * 3.0f + grad * 0.01f + texturePenalty;
             c.cellId = cellIdOf(x, y);
             candidatePool.push_back(c);
 
@@ -577,7 +592,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
                 while (cursor[cid] < vec.size())
                 {
                     const VDCandidate& cand = vec[cursor[cid]++];
-                    if (!isFarEnough(cand.x, cand.y, 18))
+                    if (!isFarEnough(cand.x, cand.y, 12))
                         continue;
 
                     selectedSeeds.push_back(cand);
@@ -645,10 +660,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         return bestD2;
     };
 
-    // ------------------------------------------------------------
-    // GT 支持收集：不要求和 Ω_vd mask 重合，而是在其附近搜“同一表面”的稀疏 GT 支撑
-    // 同时输出主峰纯度与峰间分离度
-    // ------------------------------------------------------------
     auto collectGTSupportNearVDSupport = [&](const std::vector<cv::Point>& vdSupportPts) -> GTSupportResult
     {
         GTSupportResult res;
@@ -763,7 +774,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             }
 
             int bestBin = 0;
-            int secondBin = -1;
             double bestScore = hist[0];
             double secondScore = -1.0;
             for (int b = 1; b < histBins; ++b)
@@ -771,14 +781,12 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
                 if (hist[b] > bestScore)
                 {
                     secondScore = bestScore;
-                    secondBin = bestBin;
                     bestScore = hist[b];
                     bestBin = b;
                 }
                 else if (hist[b] > secondScore)
                 {
                     secondScore = hist[b];
-                    secondBin = b;
                 }
             }
 
@@ -953,7 +961,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         std::sort(supportVDVals.begin(), supportVDVals.end());
         float vdRep = quantileFromSorted(supportVDVals, 0.5f);
 
-        // 支持域自身也要有一定结构，不然这类点训练收益低、风险高
         float supportGrayMean = 0.0f;
         for (size_t k = 0; k < supportGrayVals.size(); ++k)
             supportGrayMean += supportGrayVals[k];
@@ -970,8 +977,8 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         float meanCorner = sumCorner / static_cast<float>(supportPts.size());
         float edgeRatio = static_cast<float>(edgeCount) / static_cast<float>(supportPts.size());
 
-        if ((supportGrayMean < candidateDarkMeanReject && supportGrayStd < candidateDarkStdReject) ||
-            (supportGrayStd < supportMinGrayStd && meanCorner < supportMinCornerResp))
+        if ((supportGrayMean < 18.0f && supportGrayStd < 4.0f) ||
+            (supportGrayStd < 2.0f && meanCorner < 1.0f))
         {
             ++rejectWeakTexture;
             continue;
@@ -990,10 +997,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             continue;
         }
 
-        // GT 歧义过滤：主峰纯度太低、峰间差太小、或者搜得太远但纯度仍不够
         if (gtRes.purity < minGtPeakPurity ||
-            (gtRes.gap < minGtPeakGap && gtRes.purity < 0.72f) ||
-            (gtRes.usedRadius > softMaxGtSearchRadius && gtRes.purity < 0.75f))
+            (gtRes.gap < minGtPeakGap && gtRes.purity < 0.65f) ||
+            (gtRes.usedRadius > softMaxGtSearchRadius && gtRes.purity < 0.70f))
         {
             ++rejectAmbiguousGT;
             continue;
@@ -1012,12 +1018,11 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         sp.gtDepth = gtRep;
         samplePoints.push_back(sp);
 
-        // 调试可视化
-        cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2); // 红: seed
+        cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2);
         for (size_t k = 0; k < supportPts.size(); ++k)
-            cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);      // 黄: vd support
+            cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);
         for (size_t k = 0; k < gtRes.pts.size(); ++k)
-            cv::circle(debugVis, gtRes.pts[k], 2, cv::Scalar(0, 255, 0), -1);         // 绿: gt support
+            cv::circle(debugVis, gtRes.pts[k], 2, cv::Scalar(0, 255, 0), -1);
     }
 
     std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
