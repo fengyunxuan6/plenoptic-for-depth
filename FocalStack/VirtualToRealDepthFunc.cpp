@@ -84,604 +84,605 @@ namespace LFMVS {
         }
     }
 
-void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
-{
-    m_strRootPath = m_ptrDepthSolver->GetRootPath();
-
-    const std::string virtualDepthImgPath = m_strRootPath + "/behavior_model/VD_Raw.tiff";
-    const std::string refDepthImgPath     = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
-    const std::string focusImgPath        = m_strRootPath + "/behavior_model/fullfocus.png";
-    const std::string debugSeedPath       = m_strRootPath + "/behavior_model/vd_seed_pairs_debug.png";
-    const std::string distanceImagePath   = m_strRootPath + "/behavior_model/distanceImage_new.png";
-
-    boost::filesystem::path rootPath(m_strRootPath);
-    boost::filesystem::path rootPathParent = rootPath.parent_path();
-    const std::string strCalibPath = rootPathParent.string() + LF_CALIB_FOLDER_NAME;
-    const std::string xmlPath      = strCalibPath + "behaviorModelParamsSegment.xml";
-
-    m_virtualDepthImage = cv::imread(virtualDepthImgPath, cv::IMREAD_UNCHANGED);
-    m_refDepthImage     = cv::imread(refDepthImgPath, cv::IMREAD_UNCHANGED);
-    cv::Mat focusImage  = cv::imread(focusImgPath, cv::IMREAD_COLOR);
-
-    if (m_virtualDepthImage.empty())
+    void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     {
-        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read VD image: "
-                  << virtualDepthImgPath << std::endl;
-        return;
-    }
-    if (m_refDepthImage.empty())
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read GT image: "
-                  << refDepthImgPath << std::endl;
-        return;
-    }
-    if (focusImage.empty())
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] cannot read focus image: "
-                  << focusImgPath << std::endl;
-        return;
-    }
+        m_strRootPath = m_ptrDepthSolver->GetRootPath();
 
-    if (m_virtualDepthImage.channels() > 1)
-        extractChannel(m_virtualDepthImage, m_virtualDepthImage, 0);
-    if (m_refDepthImage.channels() > 1)
-        extractChannel(m_refDepthImage, m_refDepthImage, 0);
+        const std::string virtualDepthImgPath = m_strRootPath + "/behavior_model/VD_Raw.tiff";
+        const std::string refDepthImgPath     = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
+        const std::string focusImgPath        = m_strRootPath + "/behavior_model/fullfocus.png";
+        const std::string debugSeedPath       = m_strRootPath + "/behavior_model/vd_seed_pairs_debug.png";
+        const std::string distanceImagePath   = m_strRootPath + "/behavior_model/distanceImage_new.png";
 
-    if (m_virtualDepthImage.type() != CV_32FC1)
-        m_virtualDepthImage.convertTo(m_virtualDepthImage, CV_32F);
-    if (m_refDepthImage.type() != CV_32FC1)
-        m_refDepthImage.convertTo(m_refDepthImage, CV_32F);
+        boost::filesystem::path rootPath(m_strRootPath);
+        boost::filesystem::path rootPathParent = rootPath.parent_path();
+        const std::string strCalibPath = rootPathParent.string() + LF_CALIB_FOLDER_NAME;
+        const std::string xmlPath      = strCalibPath + "behaviorModelParamsSegment.xml";
 
-    if (focusImage.size() != m_virtualDepthImage.size())
-        cv::resize(focusImage, focusImage, m_virtualDepthImage.size(), 0.0, 0.0, cv::INTER_LINEAR);
+        m_virtualDepthImage = cv::imread(virtualDepthImgPath, cv::IMREAD_UNCHANGED);
+        m_refDepthImage     = cv::imread(refDepthImgPath, cv::IMREAD_UNCHANGED);
+        cv::Mat focusImage  = cv::imread(focusImgPath, cv::IMREAD_COLOR);
 
-    samplePoints.clear();
-    samplePointsVector.clear();
-    samplePointsVectorFiltered.clear();
-    samplePointsVectorSorted.clear();
-    m_samplePoints.clear();
-
-    struct VDCandidate
-    {
-        int x;
-        int y;
-        float vdCenter;
-        float vdMedian;
-        float vdMad;
-        float vdSpan;
-        int supportCount;
-        float aifGrad;
-        float score;
-        int cellId;
-    };
-
-    auto isValidValue = [](float v) -> bool
-    {
-        return std::isfinite(v) && v > 0.0f;
-    };
-
-    auto robustMedian = [](std::vector<float> vals) -> float
-    {
-        if (vals.empty())
-            return 0.0f;
-        const size_t mid = vals.size() / 2;
-        std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
-        float med = vals[mid];
-        if (vals.size() % 2 == 0)
+        if (m_virtualDepthImage.empty())
         {
-            float lower = *std::max_element(vals.begin(), vals.begin() + mid);
-            med = 0.5f * (lower + med);
+            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read VD image: "
+                      << virtualDepthImgPath << std::endl;
+            return;
         }
-        return med;
-    };
-
-    auto quantileFromSorted = [](const std::vector<float>& sortedVals, float q) -> float
-    {
-        if (sortedVals.empty())
-            return 0.0f;
-        if (sortedVals.size() == 1)
-            return sortedVals[0];
-
-        float pos = q * static_cast<float>(sortedVals.size() - 1);
-        int lo = static_cast<int>(std::floor(pos));
-        int hi = static_cast<int>(std::ceil(pos));
-        float t = pos - static_cast<float>(lo);
-        if (lo == hi)
-            return sortedVals[lo];
-        return sortedVals[lo] * (1.0f - t) + sortedVals[hi] * t;
-    };
-
-    auto computePatchStats = [&](const cv::Mat& src, int cx, int cy, int radius,
-                                 int minCount,
-                                 float& median,
-                                 float& mad,
-                                 float& span,
-                                 int& count) -> bool
-    {
-        std::vector<float> vals;
-        vals.reserve((2 * radius + 1) * (2 * radius + 1));
-
-        int x0 = std::max(0, cx - radius);
-        int x1 = std::min(src.cols - 1, cx + radius);
-        int y0 = std::max(0, cy - radius);
-        int y1 = std::min(src.rows - 1, cy + radius);
-
-        for (int y = y0; y <= y1; ++y)
+        if (m_refDepthImage.empty())
         {
-            for (int x = x0; x <= x1; ++x)
+            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read GT image: "
+                      << refDepthImgPath << std::endl;
+            return;
+        }
+        if (focusImage.empty())
+        {
+            std::cout << "[VirtualToRealDepthBySegBM_new] cannot read focus image: "
+                      << focusImgPath << std::endl;
+            return;
+        }
+
+        if (m_virtualDepthImage.channels() > 1)
+            extractChannel(m_virtualDepthImage, m_virtualDepthImage, 0);
+        if (m_refDepthImage.channels() > 1)
+            extractChannel(m_refDepthImage, m_refDepthImage, 0);
+
+        if (m_virtualDepthImage.type() != CV_32FC1)
+            m_virtualDepthImage.convertTo(m_virtualDepthImage, CV_32F);
+        if (m_refDepthImage.type() != CV_32FC1)
+            m_refDepthImage.convertTo(m_refDepthImage, CV_32F);
+
+        if (focusImage.size() != m_virtualDepthImage.size())
+            cv::resize(focusImage, focusImage, m_virtualDepthImage.size(), 0.0, 0.0, cv::INTER_LINEAR);
+
+        samplePoints.clear();
+        samplePointsVector.clear();
+        samplePointsVectorFiltered.clear();
+        samplePointsVectorSorted.clear();
+        m_samplePoints.clear();
+
+        struct VDCandidate
+        {
+            int x;
+            int y;
+            float vdCenter;
+            float vdMedian;
+            float vdMad;
+            float vdSpan;
+            int supportCount;
+            float aifGrad;
+            float score;
+            int cellId;
+        };
+
+        auto isValidValue = [](float v) -> bool
+        {
+            return std::isfinite(v) && v > 0.0f;
+        };
+
+        auto robustMedian = [](std::vector<float> vals) -> float
+        {
+            if (vals.empty())
+                return 0.0f;
+            const size_t mid = vals.size() / 2;
+            std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+            float med = vals[mid];
+            if (vals.size() % 2 == 0)
             {
-                float v = src.at<float>(y, x);
-                if (isValidValue(v))
-                    vals.push_back(v);
+                float lower = *std::max_element(vals.begin(), vals.begin() + mid);
+                med = 0.5f * (lower + med);
             }
-        }
+            return med;
+        };
 
-        count = static_cast<int>(vals.size());
-        if (count < minCount)
-            return false;
-
-        std::sort(vals.begin(), vals.end());
-        median = quantileFromSorted(vals, 0.5f);
-        float q10 = quantileFromSorted(vals, 0.1f);
-        float q90 = quantileFromSorted(vals, 0.9f);
-        span = q90 - q10;
-
-        std::vector<float> absDev;
-        absDev.reserve(vals.size());
-        for (size_t i = 0; i < vals.size(); ++i)
-            absDev.push_back(std::fabs(vals[i] - median));
-        std::sort(absDev.begin(), absDev.end());
-        mad = quantileFromSorted(absDev, 0.5f);
-        return true;
-    };
-
-    cv::Mat guideGray;
-    cv::cvtColor(focusImage, guideGray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(guideGray, guideGray, cv::Size(5, 5), 1.0);
-
-    cv::Mat gx, gy, guideGrad;
-    cv::Sobel(guideGray, gx, CV_32F, 1, 0, 3);
-    cv::Sobel(guideGray, gy, CV_32F, 0, 1, 3);
-    cv::magnitude(gx, gy, guideGrad);
-    {
-        double gmax = 0.0;
-        cv::minMaxLoc(guideGrad, nullptr, &gmax);
-        if (gmax > 1e-6)
-            guideGrad.convertTo(guideGrad, CV_32F, 255.0 / gmax);
-        else
-            guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
-    }
-
-    const int   candidateStride        = 3;
-    const int   candidatePatchRadius   = 2;
-    const int   candidateMinCount      = 4;
-    const float candidateMaxMad        = 0.045f;
-    const float candidateMaxSpan       = 0.18f;
-    const float candidateMaxGrad       = 95.0f;
-    const int   gridCols               = 6;
-    const int   gridRows               = 6;
-    const int   seedsPerBin            = 18;
-    const int   vdBinCount             = 8;
-
-    const int   supportSearchRadius    = 10;
-    const int   supportMaxPoints       = 12;
-    const int   supportMinPoints       = 4;
-    const float supportBandAbsMin      = 0.03f;
-    const float supportBandMadScale    = 3.0f;
-    const float supportMinMadFloor     = 0.005f;
-    const float strongEdgeThresh       = 55.0f;
-    const float maxGrayJump            = 28.0f;
-    const int   gtSearchRadius         = 3;
-    const int   minGtCount             = 2;
-    const float gtMadAbsTol            = 800.0f;
-
-    auto cellIdOf = [&](int x, int y) -> int
-    {
-        int cw = std::max(1, (m_virtualDepthImage.cols + gridCols - 1) / gridCols);
-        int ch = std::max(1, (m_virtualDepthImage.rows + gridRows - 1) / gridRows);
-        int cx = std::min(gridCols - 1, std::max(0, x / cw));
-        int cy = std::min(gridRows - 1, std::max(0, y / ch));
-        return cy * gridCols + cx;
-    };
-
-    std::vector<VDCandidate> candidatePool;
-    candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
-                          (m_virtualDepthImage.cols / candidateStride));
-
-    float vdMinAll = std::numeric_limits<float>::infinity();
-    float vdMaxAll = 0.0f;
-
-    for (int y = candidatePatchRadius; y < m_virtualDepthImage.rows - candidatePatchRadius; y += candidateStride)
-    {
-        for (int x = candidatePatchRadius; x < m_virtualDepthImage.cols - candidatePatchRadius; x += candidateStride)
+        auto quantileFromSorted = [](const std::vector<float>& sortedVals, float q) -> float
         {
-            float center = m_virtualDepthImage.at<float>(y, x);
-            if (!isValidValue(center))
-                continue;
+            if (sortedVals.empty())
+                return 0.0f;
+            if (sortedVals.size() == 1)
+                return sortedVals[0];
 
-            float median = 0.0f, mad = 0.0f, span = 0.0f;
-            int count = 0;
-            if (!computePatchStats(m_virtualDepthImage, x, y,
-                                   candidatePatchRadius,
-                                   candidateMinCount,
-                                   median, mad, span, count))
+            float pos = q * static_cast<float>(sortedVals.size() - 1);
+            int lo = static_cast<int>(std::floor(pos));
+            int hi = static_cast<int>(std::ceil(pos));
+            float t = pos - static_cast<float>(lo);
+            if (lo == hi)
+                return sortedVals[lo];
+            return sortedVals[lo] * (1.0f - t) + sortedVals[hi] * t;
+        };
+
+        auto computePatchStats = [&](const cv::Mat& src, int cx, int cy, int radius,
+                                     int minCount,
+                                     float& median,
+                                     float& mad,
+                                     float& span,
+                                     int& count) -> bool
+        {
+            std::vector<float> vals;
+            vals.reserve((2 * radius + 1) * (2 * radius + 1));
+
+            int x0 = std::max(0, cx - radius);
+            int x1 = std::min(src.cols - 1, cx + radius);
+            int y0 = std::max(0, cy - radius);
+            int y1 = std::min(src.rows - 1, cy + radius);
+
+            for (int y = y0; y <= y1; ++y)
             {
-                continue;
-            }
-
-            float grad = guideGrad.at<float>(y, x);
-            if (mad > candidateMaxMad)  continue;
-            if (span > candidateMaxSpan) continue;
-            if (grad > candidateMaxGrad) continue;
-
-            VDCandidate c;
-            c.x = x;
-            c.y = y;
-            c.vdCenter = center;
-            c.vdMedian = median;
-            c.vdMad = mad;
-            c.vdSpan = span;
-            c.supportCount = count;
-            c.aifGrad = grad;
-            c.score = mad * 8.0f + span * 4.0f + grad * 0.02f;
-            c.cellId = cellIdOf(x, y);
-            candidatePool.push_back(c);
-
-            vdMinAll = std::min(vdMinAll, median);
-            vdMaxAll = std::max(vdMaxAll, median);
-        }
-    }
-
-    std::cout << "[VirtualToRealDepthBySegBM_new] VD candidate pool size: "
-              << candidatePool.size() << std::endl;
-
-    if (candidatePool.size() < 3 || !(std::isfinite(vdMinAll) && std::isfinite(vdMaxAll) && vdMaxAll > vdMinAll))
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] no usable VD candidate pool." << std::endl;
-        return;
-    }
-
-    struct VDBin
-    {
-        float low;
-        float high;
-        std::vector<VDCandidate> candidates;
-    };
-
-    std::vector<VDBin> bins(vdBinCount);
-    const float step = (vdMaxAll - vdMinAll) / static_cast<float>(vdBinCount);
-    for (int i = 0; i < vdBinCount; ++i)
-    {
-        bins[i].low = vdMinAll + step * static_cast<float>(i);
-        bins[i].high = (i == vdBinCount - 1) ? (vdMaxAll + 1e-6f) : (vdMinAll + step * static_cast<float>(i + 1));
-    }
-
-    for (size_t i = 0; i < candidatePool.size(); ++i)
-    {
-        float v = candidatePool[i].vdMedian;
-        for (int b = 0; b < vdBinCount; ++b)
-        {
-            bool inRange = (b == vdBinCount - 1) ? (v >= bins[b].low && v <= bins[b].high)
-                                                 : (v >= bins[b].low && v < bins[b].high);
-            if (inRange)
-            {
-                bins[b].candidates.push_back(candidatePool[i]);
-                break;
-            }
-        }
-    }
-
-    std::vector<VDCandidate> selectedSeeds;
-    selectedSeeds.reserve(vdBinCount * seedsPerBin);
-    std::vector<cv::Point> selectedSeedPts;
-    auto isFarEnough = [&](int x, int y, int minDistPx) -> bool
-    {
-        for (size_t i = 0; i < selectedSeedPts.size(); ++i)
-        {
-            int dx = selectedSeedPts[i].x - x;
-            int dy = selectedSeedPts[i].y - y;
-            if (dx * dx + dy * dy < minDistPx * minDistPx)
-                return false;
-        }
-        return true;
-    };
-
-    for (int b = 0; b < vdBinCount; ++b)
-    {
-        if (bins[b].candidates.empty())
-            continue;
-
-        std::map<int, std::vector<VDCandidate> > byCell;
-        for (size_t i = 0; i < bins[b].candidates.size(); ++i)
-            byCell[bins[b].candidates[i].cellId].push_back(bins[b].candidates[i]);
-
-        for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
-        {
-            std::sort(it->second.begin(), it->second.end(),
-                      [](const VDCandidate& a, const VDCandidate& b)
-                      {
-                          if (std::fabs(a.score - b.score) > 1e-6f)
-                              return a.score < b.score;
-                          if (a.y != b.y) return a.y < b.y;
-                          return a.x < b.x;
-                      });
-        }
-
-        std::vector<int> cellOrder;
-        for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
-            cellOrder.push_back(it->first);
-        std::sort(cellOrder.begin(), cellOrder.end());
-
-        std::map<int, size_t> cursor;
-        for (size_t i = 0; i < cellOrder.size(); ++i)
-            cursor[cellOrder[i]] = 0;
-
-        int picked = 0;
-        bool progress = true;
-        while (picked < seedsPerBin && progress)
-        {
-            progress = false;
-            for (size_t ci = 0; ci < cellOrder.size() && picked < seedsPerBin; ++ci)
-            {
-                int cid = cellOrder[ci];
-                std::vector<VDCandidate>& vec = byCell[cid];
-                while (cursor[cid] < vec.size())
+                for (int x = x0; x <= x1; ++x)
                 {
-                    const VDCandidate& cand = vec[cursor[cid]++];
-                    if (!isFarEnough(cand.x, cand.y, 18))
-                        continue;
-                    selectedSeeds.push_back(cand);
-                    selectedSeedPts.push_back(cv::Point(cand.x, cand.y));
-                    ++picked;
-                    progress = true;
+                    float v = src.at<float>(y, x);
+                    if (isValidValue(v))
+                        vals.push_back(v);
+                }
+            }
+
+            count = static_cast<int>(vals.size());
+            if (count < minCount)
+                return false;
+
+            std::sort(vals.begin(), vals.end());
+            median = quantileFromSorted(vals, 0.5f);
+            float q10 = quantileFromSorted(vals, 0.1f);
+            float q90 = quantileFromSorted(vals, 0.9f);
+            span = q90 - q10;
+
+            std::vector<float> absDev;
+            absDev.reserve(vals.size());
+            for (size_t i = 0; i < vals.size(); ++i)
+                absDev.push_back(std::fabs(vals[i] - median));
+            std::sort(absDev.begin(), absDev.end());
+            mad = quantileFromSorted(absDev, 0.5f);
+            return true;
+        };
+
+        cv::Mat guideGray;
+        cv::cvtColor(focusImage, guideGray, cv::COLOR_BGR2GRAY);
+        cv::GaussianBlur(guideGray, guideGray, cv::Size(5, 5), 1.0);
+
+        cv::Mat gx, gy, guideGrad;
+        cv::Sobel(guideGray, gx, CV_32F, 1, 0, 3);
+        cv::Sobel(guideGray, gy, CV_32F, 0, 1, 3);
+        cv::magnitude(gx, gy, guideGrad);
+        {
+            double gmax = 0.0;
+            cv::minMaxLoc(guideGrad, nullptr, &gmax);
+            if (gmax > 1e-6)
+                guideGrad.convertTo(guideGrad, CV_32F, 255.0 / gmax);
+            else
+                guideGrad = cv::Mat::zeros(guideGrad.size(), CV_32F);
+        }
+
+        const int   candidateStride        = 3;
+        const int   candidatePatchRadius   = 2;
+        const int   candidateMinCount      = 4;
+        const float candidateMaxMad        = 0.045f;
+        const float candidateMaxSpan       = 0.18f;
+        const float candidateMaxGrad       = 95.0f;
+        const int   gridCols               = 6;
+        const int   gridRows               = 6;
+        const int   seedsPerBin            = 18;
+        const int   vdBinCount             = 8;
+
+        const int   supportSearchRadius    = 10;
+        const int   supportMaxPoints       = 12;
+        const int   supportMinPoints       = 4;
+        const float supportBandAbsMin      = 0.03f;
+        const float supportBandMadScale    = 3.0f;
+        const float supportMinMadFloor     = 0.005f;
+        const float strongEdgeThresh       = 55.0f;
+        const float maxGrayJump            = 28.0f;
+        const int   gtSearchRadius         = 3;
+        const int   minGtCount             = 2;
+        const float gtMadAbsTol            = 800.0f;
+
+        auto cellIdOf = [&](int x, int y) -> int
+        {
+            int cw = std::max(1, (m_virtualDepthImage.cols + gridCols - 1) / gridCols);
+            int ch = std::max(1, (m_virtualDepthImage.rows + gridRows - 1) / gridRows);
+            int cx = std::min(gridCols - 1, std::max(0, x / cw));
+            int cy = std::min(gridRows - 1, std::max(0, y / ch));
+            return cy * gridCols + cx;
+        };
+
+        std::vector<VDCandidate> candidatePool;
+        candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
+                              (m_virtualDepthImage.cols / candidateStride));
+
+        float vdMinAll = std::numeric_limits<float>::infinity();
+        float vdMaxAll = 0.0f;
+
+        for (int y = candidatePatchRadius; y < m_virtualDepthImage.rows - candidatePatchRadius; y += candidateStride)
+        {
+            for (int x = candidatePatchRadius; x < m_virtualDepthImage.cols - candidatePatchRadius; x += candidateStride)
+            {
+                float center = m_virtualDepthImage.at<float>(y, x);
+                if (!isValidValue(center))
+                    continue;
+
+                float median = 0.0f, mad = 0.0f, span = 0.0f;
+                int count = 0;
+                if (!computePatchStats(m_virtualDepthImage, x, y,
+                                       candidatePatchRadius,
+                                       candidateMinCount,
+                                       median, mad, span, count))
+                {
+                    continue;
+                }
+
+                float grad = guideGrad.at<float>(y, x);
+                if (mad > candidateMaxMad)  continue;
+                if (span > candidateMaxSpan) continue;
+                if (grad > candidateMaxGrad) continue;
+
+                VDCandidate c;
+                c.x = x;
+                c.y = y;
+                c.vdCenter = center;
+                c.vdMedian = median;
+                c.vdMad = mad;
+                c.vdSpan = span;
+                c.supportCount = count;
+                c.aifGrad = grad;
+                c.score = mad * 8.0f + span * 4.0f + grad * 0.02f;
+                c.cellId = cellIdOf(x, y);
+                candidatePool.push_back(c);
+
+                vdMinAll = std::min(vdMinAll, median);
+                vdMaxAll = std::max(vdMaxAll, median);
+            }
+        }
+
+        std::cout << "[VirtualToRealDepthBySegBM_new] VD candidate pool size: "
+                  << candidatePool.size() << std::endl;
+
+        if (candidatePool.size() < 3 || !(std::isfinite(vdMinAll) && std::isfinite(vdMaxAll) && vdMaxAll > vdMinAll))
+        {
+            std::cout << "[VirtualToRealDepthBySegBM_new] no usable VD candidate pool." << std::endl;
+            return;
+        }
+
+        struct VDBin
+        {
+            float low;
+            float high;
+            std::vector<VDCandidate> candidates;
+        };
+
+        std::vector<VDBin> bins(vdBinCount);
+        const float step = (vdMaxAll - vdMinAll) / static_cast<float>(vdBinCount);
+        for (int i = 0; i < vdBinCount; ++i)
+        {
+            bins[i].low = vdMinAll + step * static_cast<float>(i);
+            bins[i].high = (i == vdBinCount - 1) ? (vdMaxAll + 1e-6f) : (vdMinAll + step * static_cast<float>(i + 1));
+        }
+
+        for (size_t i = 0; i < candidatePool.size(); ++i)
+        {
+            float v = candidatePool[i].vdMedian;
+            for (int b = 0; b < vdBinCount; ++b)
+            {
+                bool inRange = (b == vdBinCount - 1) ? (v >= bins[b].low && v <= bins[b].high)
+                                                     : (v >= bins[b].low && v < bins[b].high);
+                if (inRange)
+                {
+                    bins[b].candidates.push_back(candidatePool[i]);
                     break;
                 }
             }
         }
-    }
 
-    std::cout << "[VirtualToRealDepthBySegBM_new] VD seed count: "
-              << selectedSeeds.size() << std::endl;
-
-    if (selectedSeeds.size() < 3)
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] not enough VD seeds." << std::endl;
-        return;
-    }
-
-    auto crossesStrongEdge = [&](int x0, int y0, int x1, int y1) -> bool
-    {
-        const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-        if (steps <= 1)
-            return false;
-
-        for (int s = 1; s < steps; ++s)
+        std::vector<VDCandidate> selectedSeeds;
+        selectedSeeds.reserve(vdBinCount * seedsPerBin);
+        std::vector<cv::Point> selectedSeedPts;
+        auto isFarEnough = [&](int x, int y, int minDistPx) -> bool
         {
-            float t = static_cast<float>(s) / static_cast<float>(steps);
-            int x = static_cast<int>(std::round((1.0f - t) * x0 + t * x1));
-            int y = static_cast<int>(std::round((1.0f - t) * y0 + t * y1));
-            x = std::max(0, std::min(guideGrad.cols - 1, x));
-            y = std::max(0, std::min(guideGrad.rows - 1, y));
-            if (guideGrad.at<float>(y, x) > strongEdgeThresh)
-                return true;
-        }
-        return false;
-    };
-
-    auto collectGTSupport = [&](const std::vector<cv::Point>& vdSupportPts,
-                                std::vector<float>& gtVals) -> bool
-    {
-        gtVals.clear();
-        std::set<std::pair<int, int> > used;
-
-        for (size_t i = 0; i < vdSupportPts.size(); ++i)
-        {
-            int cx = vdSupportPts[i].x;
-            int cy = vdSupportPts[i].y;
-
-            float bestDist2 = std::numeric_limits<float>::infinity();
-            float bestVal = 0.0f;
-            int bestX = -1, bestY = -1;
-
-            for (int dy = -gtSearchRadius; dy <= gtSearchRadius; ++dy)
+            for (size_t i = 0; i < selectedSeedPts.size(); ++i)
             {
-                for (int dx = -gtSearchRadius; dx <= gtSearchRadius; ++dx)
+                int dx = selectedSeedPts[i].x - x;
+                int dy = selectedSeedPts[i].y - y;
+                if (dx * dx + dy * dy < minDistPx * minDistPx)
+                    return false;
+            }
+            return true;
+        };
+
+        for (int b = 0; b < vdBinCount; ++b)
+        {
+            if (bins[b].candidates.empty())
+                continue;
+
+            std::map<int, std::vector<VDCandidate> > byCell;
+            for (size_t i = 0; i < bins[b].candidates.size(); ++i)
+                byCell[bins[b].candidates[i].cellId].push_back(bins[b].candidates[i]);
+
+            for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
+            {
+                std::sort(it->second.begin(), it->second.end(),
+                          [](const VDCandidate& a, const VDCandidate& b)
+                          {
+                              if (std::fabs(a.score - b.score) > 1e-6f)
+                                  return a.score < b.score;
+                              if (a.y != b.y) return a.y < b.y;
+                              return a.x < b.x;
+                          });
+            }
+
+            std::vector<int> cellOrder;
+            for (std::map<int, std::vector<VDCandidate> >::iterator it = byCell.begin(); it != byCell.end(); ++it)
+                cellOrder.push_back(it->first);
+            std::sort(cellOrder.begin(), cellOrder.end());
+
+            std::map<int, size_t> cursor;
+            for (size_t i = 0; i < cellOrder.size(); ++i)
+                cursor[cellOrder[i]] = 0;
+
+            int picked = 0;
+            bool progress = true;
+            while (picked < seedsPerBin && progress)
+            {
+                progress = false;
+                for (size_t ci = 0; ci < cellOrder.size() && picked < seedsPerBin; ++ci)
                 {
-                    int x = cx + dx;
-                    int y = cy + dy;
-                    if (x < 0 || x >= m_refDepthImage.cols || y < 0 || y >= m_refDepthImage.rows)
-                        continue;
-                    float gv = m_refDepthImage.at<float>(y, x);
-                    if (!isValidValue(gv))
-                        continue;
-                    float d2 = static_cast<float>(dx * dx + dy * dy);
-                    if (d2 < bestDist2)
+                    int cid = cellOrder[ci];
+                    std::vector<VDCandidate>& vec = byCell[cid];
+                    while (cursor[cid] < vec.size())
                     {
-                        bestDist2 = d2;
-                        bestVal = gv;
-                        bestX = x;
-                        bestY = y;
+                        const VDCandidate& cand = vec[cursor[cid]++];
+                        if (!isFarEnough(cand.x, cand.y, 18))
+                            continue;
+                        selectedSeeds.push_back(cand);
+                        selectedSeedPts.push_back(cv::Point(cand.x, cand.y));
+                        ++picked;
+                        progress = true;
+                        break;
                     }
                 }
             }
-
-            if (bestX >= 0)
-            {
-                std::pair<int, int> key(bestX, bestY);
-                if (used.insert(key).second)
-                    gtVals.push_back(bestVal);
-            }
         }
 
-        if (static_cast<int>(gtVals.size()) < minGtCount)
+        std::cout << "[VirtualToRealDepthBySegBM_new] VD seed count: "
+                  << selectedSeeds.size() << std::endl;
+
+        if (selectedSeeds.size() < 3)
+        {
+            std::cout << "[VirtualToRealDepthBySegBM_new] not enough VD seeds." << std::endl;
+            return;
+        }
+
+        auto crossesStrongEdge = [&](int x0, int y0, int x1, int y1) -> bool
+        {
+            const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+            if (steps <= 1)
+                return false;
+
+            for (int s = 1; s < steps; ++s)
+            {
+                float t = static_cast<float>(s) / static_cast<float>(steps);
+                int x = static_cast<int>(std::round((1.0f - t) * x0 + t * x1));
+                int y = static_cast<int>(std::round((1.0f - t) * y0 + t * y1));
+                x = std::max(0, std::min(guideGrad.cols - 1, x));
+                y = std::max(0, std::min(guideGrad.rows - 1, y));
+                if (guideGrad.at<float>(y, x) > strongEdgeThresh)
+                    return true;
+            }
             return false;
-
-        if (gtVals.size() >= 3)
-        {
-            std::vector<float> sorted = gtVals;
-            std::sort(sorted.begin(), sorted.end());
-            float med = quantileFromSorted(sorted, 0.5f);
-            std::vector<float> absDev;
-            absDev.reserve(sorted.size());
-            for (size_t i = 0; i < sorted.size(); ++i)
-                absDev.push_back(std::fabs(sorted[i] - med));
-            std::sort(absDev.begin(), absDev.end());
-            float mad = quantileFromSorted(absDev, 0.5f);
-            float tol = std::max(gtMadAbsTol, mad * 3.0f);
-
-            std::vector<float> filtered;
-            filtered.reserve(gtVals.size());
-            for (size_t i = 0; i < gtVals.size(); ++i)
-            {
-                if (std::fabs(gtVals[i] - med) <= tol)
-                    filtered.push_back(gtVals[i]);
-            }
-            if (static_cast<int>(filtered.size()) >= minGtCount)
-                gtVals.swap(filtered);
-        }
-
-        return static_cast<int>(gtVals.size()) >= minGtCount;
-    };
-
-    cv::Mat debugVis = focusImage.clone();
-    int rejectSupportTooSmall = 0;
-    int rejectNoGTSupport = 0;
-    int rejectEdgeCross = 0;
-
-    for (size_t i = 0; i < selectedSeeds.size(); ++i)
-    {
-        const VDCandidate& seed = selectedSeeds[i];
-        float band = std::max(supportBandAbsMin,
-                              supportBandMadScale * std::max(seed.vdMad, supportMinMadFloor));
-
-        struct Neighbor
-        {
-            int x;
-            int y;
-            float vd;
-            float dist2;
         };
 
-        std::vector<Neighbor> neighbors;
-        neighbors.reserve((2 * supportSearchRadius + 1) * (2 * supportSearchRadius + 1));
-
-        int x0 = std::max(0, seed.x - supportSearchRadius);
-        int x1 = std::min(m_virtualDepthImage.cols - 1, seed.x + supportSearchRadius);
-        int y0 = std::max(0, seed.y - supportSearchRadius);
-        int y1 = std::min(m_virtualDepthImage.rows - 1, seed.y + supportSearchRadius);
-
-        for (int y = y0; y <= y1; ++y)
+        auto collectGTSupport = [&](const std::vector<cv::Point>& vdSupportPts,
+                                    std::vector<float>& gtVals) -> bool
         {
-            for (int x = x0; x <= x1; ++x)
+            gtVals.clear();
+            std::set<std::pair<int, int> > used;
+
+            for (size_t i = 0; i < vdSupportPts.size(); ++i)
             {
-                float v = m_virtualDepthImage.at<float>(y, x);
-                if (!isValidValue(v))
-                    continue;
-                if (std::fabs(v - seed.vdMedian) > band)
-                    continue;
-                if (crossesStrongEdge(seed.x, seed.y, x, y))
+                int cx = vdSupportPts[i].x;
+                int cy = vdSupportPts[i].y;
+
+                float bestDist2 = std::numeric_limits<float>::infinity();
+                float bestVal = 0.0f;
+                int bestX = -1, bestY = -1;
+
+                for (int dy = -gtSearchRadius; dy <= gtSearchRadius; ++dy)
                 {
-                    ++rejectEdgeCross;
-                    continue;
+                    for (int dx = -gtSearchRadius; dx <= gtSearchRadius; ++dx)
+                    {
+                        int x = cx + dx;
+                        int y = cy + dy;
+                        if (x < 0 || x >= m_refDepthImage.cols || y < 0 || y >= m_refDepthImage.rows)
+                            continue;
+                        float gv = m_refDepthImage.at<float>(y, x);
+                        if (!isValidValue(gv))
+                            continue;
+                        float d2 = static_cast<float>(dx * dx + dy * dy);
+                        if (d2 < bestDist2)
+                        {
+                            bestDist2 = d2;
+                            bestVal = gv;
+                            bestX = x;
+                            bestY = y;
+                        }
+                    }
                 }
-                float d2 = static_cast<float>((x - seed.x) * (x - seed.x) + (y - seed.y) * (y - seed.y));
-                neighbors.push_back({x, y, v, d2});
+
+                if (bestX >= 0)
+                {
+                    std::pair<int, int> key(bestX, bestY);
+                    if (used.insert(key).second)
+                        gtVals.push_back(bestVal);
+                }
             }
-        }
 
-        if (neighbors.empty())
+            if (static_cast<int>(gtVals.size()) < minGtCount)
+                return false;
+
+            if (gtVals.size() >= 3)
+            {
+                std::vector<float> sorted = gtVals;
+                std::sort(sorted.begin(), sorted.end());
+                float med = quantileFromSorted(sorted, 0.5f);
+                std::vector<float> absDev;
+                absDev.reserve(sorted.size());
+                for (size_t i = 0; i < sorted.size(); ++i)
+                    absDev.push_back(std::fabs(sorted[i] - med));
+                std::sort(absDev.begin(), absDev.end());
+                float mad = quantileFromSorted(absDev, 0.5f);
+                float tol = std::max(gtMadAbsTol, mad * 3.0f);
+
+                std::vector<float> filtered;
+                filtered.reserve(gtVals.size());
+                for (size_t i = 0; i < gtVals.size(); ++i)
+                {
+                    if (std::fabs(gtVals[i] - med) <= tol)
+                        filtered.push_back(gtVals[i]);
+                }
+                if (static_cast<int>(filtered.size()) >= minGtCount)
+                    gtVals.swap(filtered);
+            }
+
+            return static_cast<int>(gtVals.size()) >= minGtCount;
+        };
+
+        cv::Mat debugVis = focusImage.clone();
+        int rejectSupportTooSmall = 0;
+        int rejectNoGTSupport = 0;
+        int rejectEdgeCross = 0;
+
+        for (size_t i = 0; i < selectedSeeds.size(); ++i)
         {
-            ++rejectSupportTooSmall;
-            continue;
+            const VDCandidate& seed = selectedSeeds[i];
+            float band = std::max(supportBandAbsMin,
+                                  supportBandMadScale * std::max(seed.vdMad, supportMinMadFloor));
+
+            struct Neighbor
+            {
+                int x;
+                int y;
+                float vd;
+                float dist2;
+            };
+
+            std::vector<Neighbor> neighbors;
+            neighbors.reserve((2 * supportSearchRadius + 1) * (2 * supportSearchRadius + 1));
+
+            int x0 = std::max(0, seed.x - supportSearchRadius);
+            int x1 = std::min(m_virtualDepthImage.cols - 1, seed.x + supportSearchRadius);
+            int y0 = std::max(0, seed.y - supportSearchRadius);
+            int y1 = std::min(m_virtualDepthImage.rows - 1, seed.y + supportSearchRadius);
+
+            for (int y = y0; y <= y1; ++y)
+            {
+                for (int x = x0; x <= x1; ++x)
+                {
+                    float v = m_virtualDepthImage.at<float>(y, x);
+                    if (!isValidValue(v))
+                        continue;
+                    if (std::fabs(v - seed.vdMedian) > band)
+                        continue;
+                    if (crossesStrongEdge(seed.x, seed.y, x, y))
+                    {
+                        ++rejectEdgeCross;
+                        continue;
+                    }
+                    float d2 = static_cast<float>((x - seed.x) * (x - seed.x) + (y - seed.y) * (y - seed.y));
+                    neighbors.push_back({x, y, v, d2});
+                }
+            }
+
+            if (neighbors.empty())
+            {
+                ++rejectSupportTooSmall;
+                continue;
+            }
+
+            std::sort(neighbors.begin(), neighbors.end(),
+                      [](const Neighbor& a, const Neighbor& b)
+                      {
+                          return a.dist2 < b.dist2;
+                      });
+
+            std::vector<cv::Point> supportPts;
+            std::vector<float> supportVDVals;
+            supportPts.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+            supportVDVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+
+            for (size_t k = 0; k < neighbors.size() && static_cast<int>(supportPts.size()) < supportMaxPoints; ++k)
+            {
+                supportPts.push_back(cv::Point(neighbors[k].x, neighbors[k].y));
+                supportVDVals.push_back(neighbors[k].vd);
+            }
+
+            if (static_cast<int>(supportPts.size()) < supportMinPoints)
+            {
+                ++rejectSupportTooSmall;
+                continue;
+            }
+
+            std::sort(supportVDVals.begin(), supportVDVals.end());
+            float vdRep = quantileFromSorted(supportVDVals, 0.5f);
+
+            std::vector<float> gtVals;
+            if (!collectGTSupport(supportPts, gtVals))
+            {
+                ++rejectNoGTSupport;
+                continue;
+            }
+
+            std::sort(gtVals.begin(), gtVals.end());
+            float gtRep = quantileFromSorted(gtVals, 0.5f);
+
+            if (!isValidValue(vdRep) || !isValidValue(gtRep))
+                continue;
+
+            SamplePoint sp;
+            sp.colIndex = seed.x;
+            sp.rowIndex = seed.y;
+            sp.vDepth = vdRep;
+            sp.gtDepth = gtRep;
+            samplePoints.push_back(sp);
+
+            cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2);
+            for (size_t k = 0; k < supportPts.size(); ++k)
+                cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);
         }
 
-        std::sort(neighbors.begin(), neighbors.end(),
-                  [](const Neighbor& a, const Neighbor& b)
-                  {
-                      return a.dist2 < b.dist2;
-                  });
+        std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
+                  << samplePoints.size() << std::endl;
+        std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportTooSmall: "
+                  << rejectSupportTooSmall << std::endl;
+        std::cout << "[VirtualToRealDepthBySegBM_new] rejectNoGTSupport: "
+                  << rejectNoGTSupport << std::endl;
+        std::cout << "[VirtualToRealDepthBySegBM_new] rejectEdgeCross: "
+                  << rejectEdgeCross << std::endl;
 
-        std::vector<cv::Point> supportPts;
-        std::vector<float> supportVDVals;
-        supportPts.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
-        supportVDVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
+        if (!debugVis.empty())
+            cv::imwrite(debugSeedPath, debugVis);
 
-        for (size_t k = 0; k < neighbors.size() && static_cast<int>(supportPts.size()) < supportMaxPoints; ++k)
+        if (samplePoints.size() < 3)
         {
-            supportPts.push_back(cv::Point(neighbors[k].x, neighbors[k].y));
-            supportVDVals.push_back(neighbors[k].vd);
+            std::cout << "[VirtualToRealDepthBySegBM_new] not enough representative pairs." << std::endl;
+            return;
         }
 
-        if (static_cast<int>(supportPts.size()) < supportMinPoints)
+        fitSegmentsParams(xmlPath);
+
+        cv::Mat realDepthImage = ConvertVdImageToRd(m_virtualDepthImage);
+        if (realDepthImage.empty())
         {
-            ++rejectSupportTooSmall;
-            continue;
+            std::cout << "[VirtualToRealDepthBySegBM_new] ConvertVdImageToRd failed." << std::endl;
+            return;
         }
 
-        std::sort(supportVDVals.begin(), supportVDVals.end());
-        float vdRep = quantileFromSorted(supportVDVals, 0.5f);
+        SamplePointSelect();
+        errorStatisticsImageSeg(realDepthImage,
+                                m_refDepthImage,
+                                m_virtualDepthImage,
+                                focusImage,
+                                distanceImagePath);
 
-        std::vector<float> gtVals;
-        if (!collectGTSupport(supportPts, gtVals))
-        {
-            ++rejectNoGTSupport;
-            continue;
-        }
-
-        std::sort(gtVals.begin(), gtVals.end());
-        float gtRep = quantileFromSorted(gtVals, 0.5f);
-
-        if (!isValidValue(vdRep) || !isValidValue(gtRep))
-            continue;
-
-        SamplePoint sp;
-        sp.colIndex = seed.x;
-        sp.rowIndex = seed.y;
-        sp.vDepth = vdRep;
-        sp.gtDepth = gtRep;
-        samplePoints.push_back(sp);
-
-        cv::circle(debugVis, cv::Point(seed.x, seed.y), 4, cv::Scalar(0, 0, 255), 2);
-        for (size_t k = 0; k < supportPts.size(); ++k)
-            cv::circle(debugVis, supportPts[k], 1, cv::Scalar(0, 255, 255), -1);
+        std::cout << "[VirtualToRealDepthBySegBM_new] done." << std::endl;
     }
 
-    std::cout << "[VirtualToRealDepthBySegBM_new] representative pair count: "
-              << samplePoints.size() << std::endl;
-    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportTooSmall: "
-              << rejectSupportTooSmall << std::endl;
-    std::cout << "[VirtualToRealDepthBySegBM_new] rejectNoGTSupport: "
-              << rejectNoGTSupport << std::endl;
-    std::cout << "[VirtualToRealDepthBySegBM_new] rejectEdgeCross: "
-              << rejectEdgeCross << std::endl;
-
-    if (!debugVis.empty())
-        cv::imwrite(debugSeedPath, debugVis);
-
-    if (samplePoints.size() < 3)
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] not enough representative pairs." << std::endl;
-        return;
-    }
-
-    fitSegmentsParams(xmlPath);
-
-    cv::Mat realDepthImage = ConvertVdImageToRd(m_virtualDepthImage);
-    if (realDepthImage.empty())
-    {
-        std::cout << "[VirtualToRealDepthBySegBM_new] ConvertVdImageToRd failed." << std::endl;
-        return;
-    }
-
-    SamplePointSelect();
-    errorStatisticsImageSeg(realDepthImage,
-                            m_refDepthImage,
-                            m_virtualDepthImage,
-                            focusImage,
-                            distanceImagePath);
-
-    std::cout << "[VirtualToRealDepthBySegBM_new] done." << std::endl;
-}
     void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_2()
     {
         m_strRootPath = m_ptrDepthSolver->GetRootPath();
