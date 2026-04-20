@@ -156,6 +156,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         float grayStd;
         float cornerResp;
         float gtDist;
+        float edgeDist;
 
         float score;
         int cellId;
@@ -342,9 +343,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     // ------------------------------------------------------------
     cv::Mat gtValidMask = cv::Mat::zeros(m_refDepthImage.size(), CV_8UC1);
     for (size_t i = 0; i < gtPoints.size(); ++i)
-    {
         gtValidMask.at<uchar>(gtPoints[i].y, gtPoints[i].x) = 255;
-    }
 
     cv::Mat invGtMask;
     cv::bitwise_not(gtValidMask, invGtMask);
@@ -354,7 +353,36 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     gtDistMap.convertTo(gtDistMap, CV_32F);
 
     // ------------------------------------------------------------
-    // 参数：这一版先放松一档，让流程先跑起来
+    // 强边缘距离图：seed 不能太靠边
+    // ------------------------------------------------------------
+    const float seedEdgeGradThresh = 55.0f;
+    cv::Mat strongEdgeMask = cv::Mat::zeros(guideGrad.size(), CV_8UC1);
+    for (int y = 0; y < guideGrad.rows; ++y)
+    {
+        const float* gptr = guideGrad.ptr<float>(y);
+        uchar* mptr = strongEdgeMask.ptr<uchar>(y);
+        for (int x = 0; x < guideGrad.cols; ++x)
+        {
+            if (gptr[x] > seedEdgeGradThresh)
+                mptr[x] = 255;
+        }
+    }
+
+    cv::Mat edgeDistMap;
+    if (cv::countNonZero(strongEdgeMask) > 0)
+    {
+        cv::Mat invStrongEdgeMask;
+        cv::bitwise_not(strongEdgeMask, invStrongEdgeMask);
+        cv::distanceTransform(invStrongEdgeMask, edgeDistMap, cv::DIST_L2, 3);
+        edgeDistMap.convertTo(edgeDistMap, CV_32F);
+    }
+    else
+    {
+        edgeDistMap = cv::Mat(m_virtualDepthImage.size(), CV_32F, cv::Scalar(9999.0f));
+    }
+
+    // ------------------------------------------------------------
+    // 参数
     // ------------------------------------------------------------
     const int   candidateStride         = 2;
     const int   candidatePatchRadius    = 2;
@@ -371,6 +399,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     const float candidateMinCornerResp  = 1.5f;
     const float candidateMaxGtDist      = 24.0f;
 
+    // 新增：seed 不能紧贴强边缘
+    const float candidateMinEdgeDist    = 5.0f;
+
     const int   gridCols                = 6;
     const int   gridRows                = 6;
     const int   seedsPerBin             = 24;
@@ -378,7 +409,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
     const int   supportSearchRadius     = 12;
     const int   supportMaxPoints        = 12;
-    const int   supportMinPoints        = 3;
+    const int   supportMinPoints        = 4;
     const float supportBandAbsMin       = 0.04f;
     const float supportBandMadScale     = 3.5f;
     const float supportMinMadFloor      = 0.006f;
@@ -388,7 +419,14 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
     const float supportMinGrayStd       = 4.0f;
     const float supportMinCornerResp    = 1.5f;
-    const float supportMaxEdgeRatio     = 0.55f;
+
+    // 新增：support 不应太“边缘化”
+    const float supportMaxEdgeRatio     = 0.35f;
+    const float supportNearEdgeDist     = 2.5f;
+    const float supportMaxNearEdgeRatio = 0.50f;
+
+    // 新增：support 不应太“线状”
+    const float minSupportShapeRatio    = 0.12f;
 
     const std::vector<int> gtSearchRadii = {8, 16, 28, 40, 56};
     const int   minGtCount              = 2;
@@ -398,6 +436,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     const float minGtPeakPurity         = 0.45f;
     const float minGtPeakGap            = 0.04f;
     const int   softMaxGtSearchRadius   = 40;
+
+    // 新增：GT support 质心不能偏离 VD support 太多
+    const float maxGTCentroidOffset     = 10.0f;
 
     const int   minRepresentativePairsForFit = 6;
 
@@ -412,7 +453,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
     // ------------------------------------------------------------
     // Step 1: VD 候选池
-    // 加入 GT 距离约束，避免 seed 落在 GT 根本支撑不到的区域
     // ------------------------------------------------------------
     std::vector<VDCandidate> candidatePool;
     candidatePool.reserve((m_virtualDepthImage.rows / candidateStride) *
@@ -420,6 +460,8 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
     float vdMinAll = std::numeric_limits<float>::infinity();
     float vdMaxAll = 0.0f;
+
+    int rejectSeedNearEdge = 0;
 
     for (int y = candidatePatchRadius; y < m_virtualDepthImage.rows - candidatePatchRadius; y += candidateStride)
     {
@@ -447,9 +489,16 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
             float corner = cornerResp.at<float>(y, x);
             float gtDist = gtDistMap.at<float>(y, x);
+            float edgeDist = edgeDistMap.at<float>(y, x);
 
             if (gtDist > candidateMaxGtDist)
                 continue;
+
+            if (edgeDist < candidateMinEdgeDist)
+            {
+                ++rejectSeedNearEdge;
+                continue;
+            }
 
             if (mad > candidateMaxMad) continue;
             if (span > candidateMaxSpan) continue;
@@ -465,7 +514,12 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             if (grayStd < 10.0f) texturePenalty += (10.0f - grayStd) * 0.05f;
             if (corner < 6.0f)   texturePenalty += (6.0f - corner) * 0.04f;
             if (grayMean < 30.0f) texturePenalty += (30.0f - grayMean) * 0.01f;
+
+            // GT 越近越优先
             texturePenalty += gtDist * 0.06f;
+
+            // 离边越近，分数越差
+            texturePenalty += 2.0f / (edgeDist + 1.0f);
 
             VDCandidate c;
             c.x = x;
@@ -480,6 +534,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             c.grayStd = grayStd;
             c.cornerResp = corner;
             c.gtDist = gtDist;
+            c.edgeDist = edgeDist;
             c.score = mad * 6.0f + span * 3.0f + grad * 0.01f + texturePenalty;
             c.cellId = cellIdOf(x, y);
             candidatePool.push_back(c);
@@ -491,6 +546,8 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
     std::cout << "[VirtualToRealDepthBySegBM_new] VD candidate pool size: "
               << candidatePool.size() << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSeedNearEdge(candidate): "
+              << rejectSeedNearEdge << std::endl;
 
     if (candidatePool.size() < 3 || !(std::isfinite(vdMinAll) && std::isfinite(vdMaxAll) && vdMaxAll > vdMinAll))
     {
@@ -865,6 +922,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     int rejectSupportEdge = 0;
     int rejectAmbiguousGT = 0;
 
+    int rejectSupportLineLike = 0;
+    int rejectGTCentroidOffset = 0;
+
     // ------------------------------------------------------------
     // Step 3: seed -> support -> GT support -> representative pair
     // ------------------------------------------------------------
@@ -934,6 +994,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         std::vector<float> supportGrayVals;
         float sumCorner = 0.0f;
         int edgeCount = 0;
+        int nearEdgeCount = 0;
 
         supportPts.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
         supportVDVals.reserve(std::min(static_cast<int>(neighbors.size()), supportMaxPoints));
@@ -950,6 +1011,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             sumCorner += cornerResp.at<float>(neighbors[k].y, neighbors[k].x);
             if (guideGrad.at<float>(neighbors[k].y, neighbors[k].x) > strongEdgeThresh)
                 edgeCount++;
+
+            if (edgeDistMap.at<float>(neighbors[k].y, neighbors[k].x) < supportNearEdgeDist)
+                nearEdgeCount++;
         }
 
         if (static_cast<int>(supportPts.size()) < supportMinPoints)
@@ -976,24 +1040,93 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
 
         float meanCorner = sumCorner / static_cast<float>(supportPts.size());
         float edgeRatio = static_cast<float>(edgeCount) / static_cast<float>(supportPts.size());
+        float nearEdgeRatio = static_cast<float>(nearEdgeCount) / static_cast<float>(supportPts.size());
 
         if ((supportGrayMean < 18.0f && supportGrayStd < 4.0f) ||
-            (supportGrayStd < 2.0f && meanCorner < 1.0f))
+            (supportGrayStd < supportMinGrayStd && meanCorner < supportMinCornerResp))
         {
             ++rejectWeakTexture;
             continue;
         }
 
-        if (edgeRatio > supportMaxEdgeRatio)
+        if (edgeRatio > supportMaxEdgeRatio || nearEdgeRatio > supportMaxNearEdgeRatio)
         {
             ++rejectSupportEdge;
             continue;
+        }
+
+        // --------------------------------------------------------
+        // support 形状约束：不要“沿边一串”的线状 support
+        // --------------------------------------------------------
+        float meanX = 0.0f, meanY = 0.0f;
+        for (size_t k = 0; k < supportPts.size(); ++k)
+        {
+            meanX += static_cast<float>(supportPts[k].x);
+            meanY += static_cast<float>(supportPts[k].y);
+        }
+        meanX /= static_cast<float>(supportPts.size());
+        meanY /= static_cast<float>(supportPts.size());
+
+        if (supportPts.size() >= 4)
+        {
+            double varXX = 0.0;
+            double varYY = 0.0;
+            double varXY = 0.0;
+
+            for (size_t k = 0; k < supportPts.size(); ++k)
+            {
+                double dx = static_cast<double>(supportPts[k].x) - meanX;
+                double dy = static_cast<double>(supportPts[k].y) - meanY;
+                varXX += dx * dx;
+                varYY += dy * dy;
+                varXY += dx * dy;
+            }
+
+            varXX /= static_cast<double>(supportPts.size());
+            varYY /= static_cast<double>(supportPts.size());
+            varXY /= static_cast<double>(supportPts.size());
+
+            double trace = varXX + varYY;
+            double det = varXX * varYY - varXY * varXY;
+            double tmp = trace * trace * 0.25 - det;
+            if (tmp < 0.0) tmp = 0.0;
+            tmp = std::sqrt(tmp);
+
+            double lambda1 = trace * 0.5 + tmp;
+            double lambda2 = trace * 0.5 - tmp;
+            double shapeRatio = (lambda1 > 1e-9) ? (lambda2 / lambda1) : 1.0;
+
+            if (shapeRatio < minSupportShapeRatio)
+            {
+                ++rejectSupportLineLike;
+                continue;
+            }
         }
 
         GTSupportResult gtRes = collectGTSupportNearVDSupport(supportPts);
         if (!gtRes.ok)
         {
             ++rejectNoGTSupport;
+            continue;
+        }
+
+        // --------------------------------------------------------
+        // GT support 质心偏移约束：避免 GT 是“从附近别处搜来的”
+        // --------------------------------------------------------
+        float gtMeanX = 0.0f, gtMeanY = 0.0f;
+        for (size_t k = 0; k < gtRes.pts.size(); ++k)
+        {
+            gtMeanX += static_cast<float>(gtRes.pts[k].x);
+            gtMeanY += static_cast<float>(gtRes.pts[k].y);
+        }
+        gtMeanX /= static_cast<float>(gtRes.pts.size());
+        gtMeanY /= static_cast<float>(gtRes.pts.size());
+
+        float gtCentroidOffset = std::sqrt((gtMeanX - meanX) * (gtMeanX - meanX) +
+                                           (gtMeanY - meanY) * (gtMeanY - meanY));
+        if (gtCentroidOffset > maxGTCentroidOffset)
+        {
+            ++rejectGTCentroidOffset;
             continue;
         }
 
@@ -1037,6 +1170,10 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
               << rejectWeakTexture << std::endl;
     std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportEdge: "
               << rejectSupportEdge << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportLineLike: "
+              << rejectSupportLineLike << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectGTCentroidOffset: "
+              << rejectGTCentroidOffset << std::endl;
     std::cout << "[VirtualToRealDepthBySegBM_new] rejectAmbiguousGT: "
               << rejectAmbiguousGT << std::endl;
 
