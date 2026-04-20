@@ -753,7 +753,7 @@ namespace LFMVS
         fcfg.enable_spike_filter = true;
         fcfg.spike_abs_diff = 1.0f;
         fcfg.spike_min_neighbors = 3;
-        fcfg.dump_debug_mask = (g_Debug_Static >= 1);
+        fcfg.dump_debug_mask = 0; // (g_Debug_Static >= 1)
 
         fcfg.dump_disp_error_map   = true;
         fcfg.disp_error_thresh_px  = 0.5f;
