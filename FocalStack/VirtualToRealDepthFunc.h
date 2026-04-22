@@ -1,10 +1,14 @@
-//
-// Created by wdy on 25-10-17.
-//
+/********************************************************************
+file base:      VirtualToRealDepthFunc.h
+author:         LZD XYY
+created:        2026/03/04
+purpose:
+*********************************************************************/
 
 #ifndef ACMP_VIRTUALTOREALDEPTHFUNC_H
 #define ACMP_VIRTUALTOREALDEPTHFUNC_H
 #include "DepthSolver.h"
+#include <chrono>
 
 namespace LFMVS
 {
@@ -210,6 +214,18 @@ namespace
         size_t pairEnd = 0;
     };
 
+    struct ManualImageViewState
+    {
+        double scale = 1.0;
+        double minScale = 0.25;
+        double maxScale = 20.0;
+
+        cv::Point2d center = cv::Point2d(-1.0, -1.0);
+
+        bool middleDragging = false;
+        cv::Point lastMouse = cv::Point(-1, -1);
+    };
+
     struct ManualUIState
     {
         cv::Mat refDepth32F;
@@ -227,7 +243,7 @@ namespace
         std::string outputFocusMarkedPath;
         std::string outputVirtualMarkedPath;
 
-        int circleRadius =50;
+        int circleRadius = 50;
 
         std::vector<ManualSelectionRecord> selections;
         std::vector<ManualPairRecord> pairRecords;
@@ -236,7 +252,15 @@ namespace
         double hoverRefMean = 0.0;
         bool hoverValid = false;
 
-        int infoScrollOffset = 0;
+        ManualImageViewState focusViewState;
+        ManualImageViewState virtualViewState;
+
+        int infoScrollPx = 0;
+        int infoContentHeight = 0;
+        bool infoScrollDragging = false;
+        int infoScrollDragOffsetY = 0;
+        cv::Rect infoScrollTrackRect;
+        cv::Rect infoScrollThumbRect;
 
         std::chrono::steady_clock::time_point lastHoverUpdateTime = std::chrono::steady_clock::now();
         bool hoverTimeInitialized = false;
@@ -287,8 +311,5 @@ namespace
         static ValidationUIState state;
         return state;
     }
-
-
 }
-
 #endif //ACMP_VIRTUALTOREALDEPTHFUNC_H
