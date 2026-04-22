@@ -92,6 +92,7 @@ namespace LFMVS
 
         void FuseVirtualDepth_BackProject_OctreeVoxel_Copy(QuadTreeProblemMapMap::iterator& itrFrame);
 
+        float ConvertVdToRdSegment(float v_depth);
     private:
 
         // 将微图像上的视差转换为虚像平面上的深度
@@ -128,8 +129,6 @@ namespace LFMVS
         bool LoadCoeffsFromXml(const std::string& xmlPath,std::array<double, 3>& behaviorModelParams);
 
         float ConvertVdToRd(float v_depth,std::array<double, 3>& behaviorModelParams);
-
-        float ConvertVdToRdSegment(float v_depth);
 
     private:
         DepthSolver*                m_ptrDepthSolver;
