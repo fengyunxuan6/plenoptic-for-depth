@@ -5951,95 +5951,136 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         return out;
     }
 
+    ////////////////////////////////////////////////////////////////////////
+    cv::Size GetManualImageViewportSize()
+    {
+        return cv::Size(950, 750);
+    }
+    cv::Size GetManualInfoPanelViewportSize()
+    {
+        return cv::Size(1400, 1100);
+    }
+
+    double GetManualBaseFitScale(const cv::Size& imageSize, const cv::Size& viewSize)
+    {
+        if (imageSize.width <= 0 || imageSize.height <= 0)
+            return 1.0;
+
+        double sx = static_cast<double>(viewSize.width) / static_cast<double>(imageSize.width);
+        double sy = static_cast<double>(viewSize.height) / static_cast<double>(imageSize.height);
+        return std::min(sx, sy);
+    }
+
+    double GetManualDisplayScale(const cv::Size& imageSize,
+                                 const cv::Size& viewSize,
+                                 const ManualImageViewState& viewState)
+    {
+        double fitScale = GetManualBaseFitScale(imageSize, viewSize);
+        double zoom = std::max(viewState.minScale, std::min(viewState.maxScale, viewState.scale));
+        return fitScale * zoom;
+    }
+
+    cv::Point2d GetManualDefaultCenter(const cv::Size& imageSize)
+    {
+        return cv::Point2d((imageSize.width - 1) * 0.5, (imageSize.height - 1) * 0.5);
+    }
+
+    ////////////////////////////////////////////////////////////////////////
 void RefreshInfoPanel()
     {
         ManualUIState& state = GetManualUIState();
 
-        const int panelWidth = 1400;
-        const int panelHeight = 1100;
+        const cv::Size panelSize = GetManualInfoPanelViewportSize();
+        const int panelWidth = panelSize.width;
+        const int panelHeight = panelSize.height;
+
+        const int headerHeight = 155;
+        const int bodyTop = headerHeight + 10;
+        const int bodyHeight = panelHeight - bodyTop - 20;
+
         const int scrollBarWidth = 18;
         const int scrollBarMargin = 8;
-        const int trackTop = 165;
-        const int trackBottomMargin = 20;
+        const int leftX = 20;
+        const int rightX = 720;
         const int contentRightSafe = panelWidth - scrollBarWidth - scrollBarMargin * 3;
 
-        int maxPointLinesToShow = 10;
+        state.infoPanel = cv::Mat(panelSize, CV_8UC3, cv::Scalar(255, 255, 255));
 
-        int estimatedContentHeight = 190 +
-                                     static_cast<int>(state.selections.size()) * ((maxPointLinesToShow + 4) * 22 + 30);
-        estimatedContentHeight = std::max(panelHeight, estimatedContentHeight + 40);
-
-        cv::Mat content(estimatedContentHeight, panelWidth, CV_8UC3, cv::Scalar(255, 255, 255));
-
-        cv::putText(content, "Manual Pair Selection", cv::Point(20, 35),
+        cv::putText(state.infoPanel, "Manual Pair Selection", cv::Point(20, 35),
                     cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 0), 2);
 
-        cv::putText(content,
-                    "Controls: Left click add circle | Right click or Z/U undo | Mouse wheel on image = zoom | Middle drag = pan | InfoPanel wheel / drag scrollbar = scroll",
-                    cv::Point(20, 70), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(20, 20, 20), 1);
+        cv::putText(state.infoPanel,
+                    "Left click add | Right click or Z/U undo | Mouse wheel on image = zoom | Middle drag = pan | InfoPanel wheel/drag = scroll",
+                    cv::Point(20, 68), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(20, 20, 20), 1);
 
-        cv::putText(content, "Left column: VD values / VD RMSE", cv::Point(20, 110),
+        cv::putText(state.infoPanel, "Left column: VD values / VD RMSE", cv::Point(20, 102),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(160, 0, 0), 2);
-        cv::putText(content, "Right column: REF values / REF RMSE", cv::Point(720, 110),
+        cv::putText(state.infoPanel, "Right column: REF values / REF RMSE", cv::Point(720, 102),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 100, 0), 2);
 
         std::string summary =
                 "Selections: " + std::to_string(state.selections.size()) +
-                "   Kept pairs(mean vd, mean ref): " + std::to_string(state.pairRecords.size()) +
-                "   Circle radius: " + std::to_string(state.circleRadius) +
-                "   ScrollPx: " + std::to_string(state.infoScrollPx);
-        cv::putText(content, summary, cv::Point(20, 145),
+                "   KeptPairs(mean vd, mean ref): " + std::to_string(state.pairRecords.size()) +
+                "   Circle radius: " + std::to_string(state.circleRadius);
+        cv::putText(state.infoPanel, summary, cv::Point(20, 135),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(40, 40, 40), 1);
 
-        int y = 185;
+        int bodyContentY = 0;
+
+        auto drawBodyText = [&](const std::string& text,
+                                int x,
+                                int yBaselineInBody,
+                                double fontScale,
+                                const cv::Scalar& color,
+                                int thickness)
+        {
+            int yPanel = bodyTop + (yBaselineInBody - state.infoScrollPx);
+            if (yPanel >= bodyTop - 30 && yPanel <= panelHeight + 30)
+            {
+                cv::putText(state.infoPanel, text, cv::Point(x, yPanel),
+                            cv::FONT_HERSHEY_SIMPLEX, fontScale, color, thickness, cv::LINE_AA);
+            }
+        };
+
+        auto drawBodyLine = [&](int yInBody, const cv::Scalar& color, int thickness)
+        {
+            int yPanel = bodyTop + (yInBody - state.infoScrollPx);
+            if (yPanel >= bodyTop - 10 && yPanel <= panelHeight + 10)
+            {
+                cv::line(state.infoPanel, cv::Point(20, yPanel), cv::Point(contentRightSafe, yPanel), color, thickness);
+            }
+        };
 
         for (int i = 0; i < static_cast<int>(state.selections.size()); ++i)
         {
             const ManualSelectionRecord& rec = state.selections[i];
-            int validPairCount = static_cast<int>(rec.pairEnd - rec.pairBegin);
+            int keptPairCount = static_cast<int>(rec.pairEnd - rec.pairBegin);
 
             std::string title =
                     "#" + std::to_string(i + 1) +
-                    " p=(" + std::to_string(rec.center.x) + "," + std::to_string(rec.center.y) + ")" +
-                    " src=" + rec.sourceWindow +
-                    " n=" + std::to_string(rec.circlePoints.size()) +
-                    " kept=" + std::to_string(validPairCount);
+                    "  p=(" + std::to_string(rec.center.x) + "," + std::to_string(rec.center.y) + ")" +
+                    "  src=" + rec.sourceWindow +
+                    "  circlePts=" + std::to_string(rec.circlePoints.size()) +
+                    "  kept=" + std::to_string(keptPairCount);
 
-            cv::putText(content, title, cv::Point(20, y),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(0, 0, 0), 1);
-            y += 26;
+            drawBodyText(title, 20, bodyContentY + 22, 0.52, cv::Scalar(0, 0, 0), 1);
+            bodyContentY += 30;
 
-            int detailStartY = y;
+            int lineCount = std::max(static_cast<int>(rec.vdPointLines.size()),
+                                     static_cast<int>(rec.refPointLines.size()));
 
-            for (int k = 0; k < static_cast<int>(rec.vdPointLines.size()) && k < maxPointLinesToShow; ++k)
+            for (int k = 0; k < lineCount; ++k)
             {
-                cv::putText(content, rec.vdPointLines[k], cv::Point(40, detailStartY + k * 22),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
-            }
+                int baseline = bodyContentY + 18;
 
-            for (int k = 0; k < static_cast<int>(rec.refPointLines.size()) && k < maxPointLinesToShow; ++k)
-            {
-                cv::putText(content, rec.refPointLines[k], cv::Point(720, detailStartY + k * 22),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
-            }
+                if (k < static_cast<int>(rec.vdPointLines.size()))
+                    drawBodyText(rec.vdPointLines[k], leftX, baseline, 0.38, cv::Scalar(80, 80, 80), 1);
 
-            if (static_cast<int>(rec.vdPointLines.size()) > maxPointLinesToShow)
-            {
-                std::string moreLeft =
-                        "... " + std::to_string(rec.vdPointLines.size() - maxPointLinesToShow) + " more vd points";
-                cv::putText(content, moreLeft, cv::Point(40, detailStartY + maxPointLinesToShow * 22),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
-            }
+                if (k < static_cast<int>(rec.refPointLines.size()))
+                    drawBodyText(rec.refPointLines[k], rightX, baseline, 0.38, cv::Scalar(80, 80, 80), 1);
 
-            if (static_cast<int>(rec.refPointLines.size()) > maxPointLinesToShow)
-            {
-                std::string moreRight =
-                        "... " + std::to_string(rec.refPointLines.size() - maxPointLinesToShow) + " more ref points";
-                cv::putText(content, moreRight, cv::Point(720, detailStartY + maxPointLinesToShow * 22),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
+                bodyContentY += 20;
             }
-
-            y = detailStartY + (maxPointLinesToShow + 1) * 22;
 
             std::string leftRmse =
                     "VD  : count=" + std::to_string(rec.vdValues.size()) +
@@ -6051,50 +6092,38 @@ void RefreshInfoPanel()
                     "  mean=" + std::string(cv::format("%.6f", ComputeMeanFromValidValues(rec.refValues))) +
                     "  rmse=" + std::string(cv::format("%.6f", rec.refRmse));
 
-            cv::putText(content, leftRmse, cv::Point(40, y),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(160, 0, 0), 1);
+            drawBodyText(leftRmse, leftX, bodyContentY + 18, 0.44, cv::Scalar(160, 0, 0), 1);
+            drawBodyText(rightRmse, rightX, bodyContentY + 18, 0.44, cv::Scalar(0, 120, 0), 1);
+            bodyContentY += 32;
 
-            cv::putText(content, rightRmse, cv::Point(720, y),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(0, 120, 0), 1);
-
-            y += 42;
-
-            cv::line(content, cv::Point(20, y - 18), cv::Point(contentRightSafe, y - 18),
-                     cv::Scalar(220, 220, 220), 1);
-
-            y += 10;
+            drawBodyLine(bodyContentY, cv::Scalar(220, 220, 220), 1);
+            bodyContentY += 14;
         }
 
-        int contentHeight = std::max(panelHeight, y + 20);
-        if (content.rows != contentHeight)
-            content = content.rowRange(0, contentHeight).clone();
+        state.infoContentHeight = std::max(bodyHeight, bodyContentY + 10);
 
-        state.infoContentHeight = contentHeight;
-
-        int maxScrollPx = std::max(0, contentHeight - panelHeight);
+        int maxScrollPx = std::max(0, state.infoContentHeight - bodyHeight);
         state.infoScrollPx = std::max(0, std::min(maxScrollPx, state.infoScrollPx));
-
-        state.infoPanel = cv::Mat(panelHeight, panelWidth, CV_8UC3, cv::Scalar(255, 255, 255));
-        content(cv::Rect(0, state.infoScrollPx, panelWidth, panelHeight)).copyTo(state.infoPanel);
 
         state.infoScrollTrackRect = cv::Rect();
         state.infoScrollThumbRect = cv::Rect();
 
         if (maxScrollPx > 0)
         {
-            int trackHeight = panelHeight - trackTop - trackBottomMargin;
             int trackX = panelWidth - scrollBarWidth - scrollBarMargin;
-            int trackY = trackTop;
+            int trackY = bodyTop;
+            int trackHeight = bodyHeight;
 
             state.infoScrollTrackRect = cv::Rect(trackX, trackY, scrollBarWidth, trackHeight);
 
-            double visibleRatio = static_cast<double>(panelHeight) / static_cast<double>(contentHeight);
+            double visibleRatio = static_cast<double>(bodyHeight) / static_cast<double>(state.infoContentHeight);
             int thumbHeight = std::max(60, static_cast<int>(std::round(trackHeight * visibleRatio)));
             thumbHeight = std::min(trackHeight, thumbHeight);
 
             int movableRange = std::max(1, trackHeight - thumbHeight);
             int thumbY = trackY + static_cast<int>(
-                    std::round(movableRange * static_cast<double>(state.infoScrollPx) / static_cast<double>(maxScrollPx)));
+                    std::round(static_cast<double>(state.infoScrollPx) /
+                               static_cast<double>(maxScrollPx) * movableRange));
 
             state.infoScrollThumbRect = cv::Rect(trackX, thumbY, scrollBarWidth, thumbHeight);
 
@@ -6104,8 +6133,6 @@ void RefreshInfoPanel()
             cv::rectangle(state.infoPanel, state.infoScrollThumbRect, cv::Scalar(150, 150, 150), cv::FILLED);
             cv::rectangle(state.infoPanel, state.infoScrollThumbRect, cv::Scalar(100, 100, 100), 1);
         }
-
-        cv::imshow("InfoPanel", state.infoPanel);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////
@@ -6113,7 +6140,9 @@ void RefreshInfoPanel()
     void InitManualImageViewState(ManualImageViewState& viewState, const cv::Size& size)
     {
         viewState.scale = 1.0;
-        viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
+        viewState.minScale = 0.5;
+        viewState.maxScale = 20.0;
+        viewState.center = GetManualDefaultCenter(size);
         viewState.middleDragging = false;
         viewState.lastMouse = cv::Point(-1, -1);
     }
@@ -6123,30 +6152,45 @@ void RefreshInfoPanel()
         if (size.width <= 0 || size.height <= 0)
             return;
 
-        if (viewState.center.x < 0.0 || viewState.center.y < 0.0)
+        const cv::Size viewSize = GetManualImageViewportSize();
+        const double scalePx = GetManualDisplayScale(size, viewSize, viewState);
+        if (scalePx <= 1.0e-12)
         {
-            viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
-        }
-
-        if (viewState.scale <= 1.0)
-        {
-            viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
+            viewState.center = GetManualDefaultCenter(size);
             return;
         }
 
-        int roiW = std::max(1, static_cast<int>(std::round(size.width / viewState.scale)));
-        int roiH = std::max(1, static_cast<int>(std::round(size.height / viewState.scale)));
+        if (!std::isfinite(viewState.center.x) || !std::isfinite(viewState.center.y))
+        {
+            viewState.center = GetManualDefaultCenter(size);
+        }
 
-        double halfW = roiW * 0.5;
-        double halfH = roiH * 0.5;
+        const double halfVisibleW = static_cast<double>(viewSize.width) / (2.0 * scalePx);
+        const double halfVisibleH = static_cast<double>(viewSize.height) / (2.0 * scalePx);
 
-        double minCx = halfW;
-        double maxCx = std::max(minCx, static_cast<double>(size.width) - halfW);
-        double minCy = halfH;
-        double maxCy = std::max(minCy, static_cast<double>(size.height) - halfH);
+        const cv::Point2d defaultCenter = GetManualDefaultCenter(size);
 
-        viewState.center.x = std::max(minCx, std::min(maxCx, viewState.center.x));
-        viewState.center.y = std::max(minCy, std::min(maxCy, viewState.center.y));
+        if (halfVisibleW * 2.0 >= static_cast<double>(size.width))
+        {
+            viewState.center.x = defaultCenter.x;
+        }
+        else
+        {
+            double minCx = halfVisibleW;
+            double maxCx = (size.width - 1) - halfVisibleW;
+            viewState.center.x = std::max(minCx, std::min(maxCx, viewState.center.x));
+        }
+
+        if (halfVisibleH * 2.0 >= static_cast<double>(size.height))
+        {
+            viewState.center.y = defaultCenter.y;
+        }
+        else
+        {
+            double minCy = halfVisibleH;
+            double maxCy = (size.height - 1) - halfVisibleH;
+            viewState.center.y = std::max(minCy, std::min(maxCy, viewState.center.y));
+        }
     }
 
     cv::Rect BuildManualViewRoi(const ManualImageViewState& viewState, const cv::Size& size)
@@ -6205,61 +6249,45 @@ void RefreshInfoPanel()
     }
 
     bool MapDisplayPointToManualImage(const cv::Point& displayPt,
-                                      const cv::Size& imageSize,
-                                      const ManualImageViewState& viewState,
-                                      cv::Point& imagePt)
+                                          const cv::Size& imageSize,
+                                          const ManualImageViewState& viewState,
+                                          cv::Point& imagePt)
     {
+        const cv::Size viewSize = GetManualImageViewportSize();
+
         if (imageSize.width <= 0 || imageSize.height <= 0)
             return false;
 
         if (displayPt.x < 0 || displayPt.y < 0 ||
-            displayPt.x >= imageSize.width || displayPt.y >= imageSize.height)
+            displayPt.x >= viewSize.width || displayPt.y >= viewSize.height)
             return false;
 
-        if (viewState.scale <= 1.0)
+        const double scalePx = GetManualDisplayScale(imageSize, viewSize, viewState);
+        if (scalePx <= 1.0e-12)
+            return false;
+
+        const double viewCx = (viewSize.width - 1) * 0.5;
+        const double viewCy = (viewSize.height - 1) * 0.5;
+
+        double imgX = viewState.center.x + (static_cast<double>(displayPt.x) - viewCx) / scalePx;
+        double imgY = viewState.center.y + (static_cast<double>(displayPt.y) - viewCy) / scalePx;
+
+        if (imgX < 0.0 || imgY < 0.0 ||
+            imgX > static_cast<double>(imageSize.width - 1) ||
+            imgY > static_cast<double>(imageSize.height - 1))
         {
-            int scaledW = std::max(1, static_cast<int>(std::round(imageSize.width * viewState.scale)));
-            int scaledH = std::max(1, static_cast<int>(std::round(imageSize.height * viewState.scale)));
-            int offX = (imageSize.width - scaledW) / 2;
-            int offY = (imageSize.height - scaledH) / 2;
-
-            if (displayPt.x < offX || displayPt.x >= offX + scaledW ||
-                displayPt.y < offY || displayPt.y >= offY + scaledH)
-                return false;
-
-            double localX = static_cast<double>(displayPt.x - offX) / std::max(1, scaledW - 1);
-            double localY = static_cast<double>(displayPt.y - offY) / std::max(1, scaledH - 1);
-
-            int srcX = static_cast<int>(std::round(localX * (imageSize.width - 1)));
-            int srcY = static_cast<int>(std::round(localY * (imageSize.height - 1)));
-
-            srcX = std::max(0, std::min(imageSize.width - 1, srcX));
-            srcY = std::max(0, std::min(imageSize.height - 1, srcY));
-
-            imagePt = cv::Point(srcX, srcY);
-            return true;
+            return false;
         }
-        else
-        {
-            ManualImageViewState tmpState = viewState;
-            ClampManualImageViewState(tmpState, imageSize);
-            cv::Rect roi = BuildManualViewRoi(tmpState, imageSize);
 
-            double localX = static_cast<double>(displayPt.x) / std::max(1, imageSize.width - 1);
-            double localY = static_cast<double>(displayPt.y) / std::max(1, imageSize.height - 1);
+        imagePt.x = static_cast<int>(std::round(imgX));
+        imagePt.y = static_cast<int>(std::round(imgY));
 
-            int srcX = roi.x + static_cast<int>(std::round(localX * (roi.width - 1)));
-            int srcY = roi.y + static_cast<int>(std::round(localY * (roi.height - 1)));
-
-            srcX = std::max(0, std::min(imageSize.width - 1, srcX));
-            srcY = std::max(0, std::min(imageSize.height - 1, srcY));
-
-            imagePt = cv::Point(srcX, srcY);
-            return true;
-        }
+        imagePt.x = std::max(0, std::min(imageSize.width - 1, imagePt.x));
+        imagePt.y = std::max(0, std::min(imageSize.height - 1, imagePt.y));
+        return true;
     }
 
-    void ZoomManualImageView(ManualImageViewState& viewState,
+void ZoomManualImageView(ManualImageViewState& viewState,
                              const cv::Size& imageSize,
                              const cv::Point& displayPt,
                              int wheelDelta)
@@ -6267,21 +6295,33 @@ void RefreshInfoPanel()
         if (imageSize.width <= 0 || imageSize.height <= 0)
             return;
 
-        cv::Point imagePt;
-        bool hasAnchor = MapDisplayPointToManualImage(displayPt, imageSize, viewState, imagePt);
+        const cv::Size viewSize = GetManualImageViewportSize();
+        const double viewCx = (viewSize.width - 1) * 0.5;
+        const double viewCy = (viewSize.height - 1) * 0.5;
 
-        double zoomFactor = (wheelDelta > 0) ? 1.20 : (1.0 / 1.20);
-        double newScale = viewState.scale * zoomFactor;
-        newScale = std::max(viewState.minScale, std::min(viewState.maxScale, newScale));
+        double oldZoom = viewState.scale;
+        double factor = (wheelDelta > 0) ? 1.20 : (1.0 / 1.20);
+        double newZoom = oldZoom * factor;
+        newZoom = std::max(viewState.minScale, std::min(viewState.maxScale, newZoom));
 
-        if (std::fabs(newScale - viewState.scale) < 1e-12)
+        if (std::fabs(newZoom - oldZoom) < 1.0e-12)
             return;
 
-        viewState.scale = newScale;
+        double oldScalePx = GetManualDisplayScale(imageSize, viewSize, viewState);
 
-        if (hasAnchor)
+        cv::Point imgAnchorInt;
+        bool hasAnchor = MapDisplayPointToManualImage(displayPt, imageSize, viewState, imgAnchorInt);
+
+        viewState.scale = newZoom;
+
+        if (hasAnchor && oldScalePx > 1.0e-12)
         {
-            viewState.center = cv::Point2d(imagePt.x, imagePt.y);
+            double newScalePx = GetManualDisplayScale(imageSize, viewSize, viewState);
+            double imgAnchorX = static_cast<double>(imgAnchorInt.x);
+            double imgAnchorY = static_cast<double>(imgAnchorInt.y);
+
+            viewState.center.x = imgAnchorX - (static_cast<double>(displayPt.x) - viewCx) / newScalePx;
+            viewState.center.y = imgAnchorY - (static_cast<double>(displayPt.y) - viewCy) / newScalePx;
         }
 
         ClampManualImageViewState(viewState, imageSize);
@@ -6291,7 +6331,12 @@ void RefreshInfoPanel()
                             const cv::Size& imageSize,
                             const cv::Point& currentMouse)
     {
-        if (viewState.scale <= 1.0)
+        if (imageSize.width <= 0 || imageSize.height <= 0)
+            return;
+
+        const cv::Size viewSize = GetManualImageViewportSize();
+        const double scalePx = GetManualDisplayScale(imageSize, viewSize, viewState);
+        if (scalePx <= 1.0e-12)
             return;
 
         if (viewState.lastMouse.x < 0 || viewState.lastMouse.y < 0)
@@ -6300,21 +6345,128 @@ void RefreshInfoPanel()
             return;
         }
 
-        ManualImageViewState tmpState = viewState;
-        ClampManualImageViewState(tmpState, imageSize);
-        cv::Rect roi = BuildManualViewRoi(tmpState, imageSize);
+        double dx = static_cast<double>(currentMouse.x - viewState.lastMouse.x);
+        double dy = static_cast<double>(currentMouse.y - viewState.lastMouse.y);
 
-        double dxWin = static_cast<double>(currentMouse.x - viewState.lastMouse.x);
-        double dyWin = static_cast<double>(currentMouse.y - viewState.lastMouse.y);
-
-        double dxImg = dxWin * roi.width / std::max(1, imageSize.width);
-        double dyImg = dyWin * roi.height / std::max(1, imageSize.height);
-
-        viewState.center.x -= dxImg;
-        viewState.center.y -= dyImg;
+        viewState.center.x -= dx / scalePx;
+        viewState.center.y -= dy / scalePx;
         viewState.lastMouse = currentMouse;
 
         ClampManualImageViewState(viewState, imageSize);
+    }
+
+    cv::Point2d MapManualImagePointToDisplay(const cv::Point2d& imagePt,
+                                                 const cv::Size& imageSize,
+                                                 const ManualImageViewState& viewState)
+    {
+        const cv::Size viewSize = GetManualImageViewportSize();
+        const double scalePx = GetManualDisplayScale(imageSize, viewSize, viewState);
+
+        const double viewCx = (viewSize.width - 1) * 0.5;
+        const double viewCy = (viewSize.height - 1) * 0.5;
+
+        return cv::Point2d(
+                (imagePt.x - viewState.center.x) * scalePx + viewCx,
+                (imagePt.y - viewState.center.y) * scalePx + viewCy);
+    }
+
+    void RenderManualView(const cv::Mat& baseImage,
+                          const ManualImageViewState& viewState,
+                          const std::vector<ManualSelectionRecord>& selections,
+                          int circleRadius,
+                          bool drawHover,
+                          const cv::Point& hoverPoint,
+                          double hoverRefMean,
+                          cv::Mat& dst)
+    {
+        const cv::Size viewSize = GetManualImageViewportSize();
+
+        if (baseImage.empty())
+        {
+            dst = cv::Mat(viewSize, CV_8UC3, cv::Scalar(30, 30, 30));
+            return;
+        }
+
+        cv::Mat src;
+        if (baseImage.channels() == 1)
+            cv::cvtColor(baseImage, src, cv::COLOR_GRAY2BGR);
+        else
+            src = baseImage;
+
+        ManualImageViewState clampedState = viewState;
+        ClampManualImageViewState(clampedState, src.size());
+
+        const double scalePx = GetManualDisplayScale(src.size(), viewSize, clampedState);
+        const double viewCx = (viewSize.width - 1) * 0.5;
+        const double viewCy = (viewSize.height - 1) * 0.5;
+
+        cv::Matx23d M(
+                1.0 / scalePx, 0.0, clampedState.center.x - viewCx / scalePx,
+                0.0, 1.0 / scalePx, clampedState.center.y - viewCy / scalePx
+        );
+
+        dst.create(viewSize, CV_8UC3);
+        cv::warpAffine(src, dst, M, viewSize,
+                       cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+                       cv::BORDER_CONSTANT, cv::Scalar(30, 30, 30));
+
+        int circleThickness = std::max(1, static_cast<int>(std::round(2.0 * std::min(1.5, scalePx))));
+        int pointRadius = std::max(2, static_cast<int>(std::round(3.0 * std::min(2.0, scalePx))));
+        int showCircleRadius = std::max(2, static_cast<int>(std::round(circleRadius * scalePx)));
+
+        for (size_t i = 0; i < selections.size(); ++i)
+        {
+            const ManualSelectionRecord& rec = selections[i];
+            cv::Point2d disp = MapManualImagePointToDisplay(
+                    cv::Point2d(rec.center.x, rec.center.y), src.size(), clampedState);
+
+            if (disp.x < -showCircleRadius || disp.y < -showCircleRadius ||
+                disp.x > viewSize.width + showCircleRadius || disp.y > viewSize.height + showCircleRadius)
+            {
+                continue;
+            }
+
+            cv::Scalar color = (i + 1 == selections.size()) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
+
+            cv::circle(dst,
+                       cv::Point(static_cast<int>(std::round(disp.x)), static_cast<int>(std::round(disp.y))),
+                       showCircleRadius, color, circleThickness, cv::LINE_AA);
+
+            cv::circle(dst,
+                       cv::Point(static_cast<int>(std::round(disp.x)), static_cast<int>(std::round(disp.y))),
+                       pointRadius, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
+
+            std::string idx = std::to_string(static_cast<int>(i + 1));
+            cv::putText(dst, idx,
+                        cv::Point(static_cast<int>(std::round(disp.x)) + 5,
+                                  static_cast<int>(std::round(disp.y)) - 5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
+        }
+
+        if (drawHover && hoverPoint.x >= 0 && hoverPoint.y >= 0)
+        {
+            cv::Point2d disp = MapManualImagePointToDisplay(
+                    cv::Point2d(hoverPoint.x, hoverPoint.y), src.size(), clampedState);
+
+            if (disp.x >= -50 && disp.y >= -50 &&
+                disp.x <= viewSize.width + 50 && disp.y <= viewSize.height + 50)
+            {
+                cv::circle(dst,
+                           cv::Point(static_cast<int>(std::round(disp.x)), static_cast<int>(std::round(disp.y))),
+                           pointRadius + 2, cv::Scalar(255, 0, 255), -1, cv::LINE_AA);
+            }
+
+            std::string hoverText =
+                    "hover ref mean = " + std::string(cv::format("%.3f", hoverRefMean)) +
+                    "  at (" + std::to_string(hoverPoint.x) + "," + std::to_string(hoverPoint.y) + ")";
+            cv::putText(dst, hoverText, cv::Point(20, 70),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
+        }
+
+        std::string scaleText = "Zoom: " + std::string(cv::format("%.2fx", clampedState.scale)) +
+                                "   Wheel=Zoom  MiddleDrag=Pan  R=Reset";
+        cv::putText(dst, scaleText, cv::Point(20, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
     }
 
     void BuildAnnotatedManualImages(cv::Mat& refAnnotated,
@@ -6356,11 +6508,23 @@ void RefreshInfoPanel()
     {
         ManualUIState& state = GetManualUIState();
 
-        cv::Mat refAnnotated, virtualAnnotated;
-        BuildAnnotatedManualImages(refAnnotated, virtualAnnotated);
+        RenderManualView(state.refFocusBase,
+                         state.focusViewState,
+                         state.selections,
+                         state.circleRadius,
+                         state.hoverValid,
+                         state.hoverPoint,
+                         state.hoverRefMean,
+                         state.refFocusShow);
 
-        RenderManualZoomedImage(refAnnotated, state.focusViewState, state.refFocusShow);
-        RenderManualZoomedImage(virtualAnnotated, state.virtualViewState, state.virtualColorShow);
+        RenderManualView(state.virtualColorBase,
+                         state.virtualViewState,
+                         state.selections,
+                         state.circleRadius,
+                         false,
+                         cv::Point(-1, -1),
+                         0.0,
+                         state.virtualColorShow);
 
         RefreshInfoPanel();
 
@@ -6449,10 +6613,9 @@ void RefreshInfoPanel()
         RefreshManualWindows();
     }
 
- void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
+void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
     {
         (void)userdata;
-
         ManualUIState& state = GetManualUIState();
 
         if (event == cv::EVENT_MOUSEWHEEL)
@@ -6485,9 +6648,7 @@ void RefreshInfoPanel()
 
         if (event == cv::EVENT_MOUSEMOVE && state.focusViewState.middleDragging)
         {
-            PanManualImageView(state.focusViewState,
-                               state.refDepth32F.size(),
-                               cv::Point(x, y));
+            PanManualImageView(state.focusViewState, state.refDepth32F.size(), cv::Point(x, y));
             RefreshManualWindows();
             return;
         }
@@ -6499,7 +6660,9 @@ void RefreshInfoPanel()
                                               state.refDepth32F.size(),
                                               state.focusViewState,
                                               imgPt))
+            {
                 return;
+            }
 
             auto now = std::chrono::steady_clock::now();
 
@@ -6548,7 +6711,6 @@ void RefreshInfoPanel()
     void OnMouseVirtual(int event, int x, int y, int flags, void* userdata)
     {
         (void)userdata;
-
         ManualUIState& state = GetManualUIState();
 
         if (event == cv::EVENT_MOUSEWHEEL)
@@ -6581,9 +6743,7 @@ void RefreshInfoPanel()
 
         if (event == cv::EVENT_MOUSEMOVE && state.virtualViewState.middleDragging)
         {
-            PanManualImageView(state.virtualViewState,
-                               state.virtualDepth32F.size(),
-                               cv::Point(x, y));
+            PanManualImageView(state.virtualViewState, state.virtualDepth32F.size(), cv::Point(x, y));
             RefreshManualWindows();
             return;
         }
@@ -6605,14 +6765,17 @@ void RefreshInfoPanel()
         }
     }
 
-void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
+    void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
     {
         (void)userdata;
-
         ManualUIState& state = GetManualUIState();
 
-        int panelHeight = state.infoPanel.empty() ? 1100 : state.infoPanel.rows;
-        int maxScrollPx = std::max(0, state.infoContentHeight - panelHeight);
+        const cv::Size panelSize = GetManualInfoPanelViewportSize();
+        const int headerHeight = 155;
+        const int bodyTop = headerHeight + 10;
+        const int bodyHeight = panelSize.height - bodyTop - 20;
+
+        int maxScrollPx = std::max(0, state.infoContentHeight - bodyHeight);
 
         if (event == cv::EVENT_MOUSEWHEEL)
         {
@@ -6652,7 +6815,8 @@ void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
                 if (maxScrollPx > 0)
                 {
                     state.infoScrollPx = static_cast<int>(
-                            std::round(static_cast<double>(localTop) / static_cast<double>(movableRange) *
+                            std::round(static_cast<double>(localTop) /
+                                       static_cast<double>(movableRange) *
                                        static_cast<double>(maxScrollPx)));
                 }
                 else
@@ -6681,7 +6845,8 @@ void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
                 if (maxScrollPx > 0)
                 {
                     state.infoScrollPx = static_cast<int>(
-                            std::round(static_cast<double>(localTop) / static_cast<double>(movableRange) *
+                            std::round(static_cast<double>(localTop) /
+                                       static_cast<double>(movableRange) *
                                        static_cast<double>(maxScrollPx)));
                 }
                 else
@@ -6895,12 +7060,12 @@ void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
         std::cout << "DepthMax(min gt -> vd): " << depthMax << std::endl;
     }
 
-void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameName)
+     void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameName)
     {
         m_strRootPath = m_ptrDepthSolver->GetRootPath();
 
         std::string strCommonPath = m_strRootPath + LF_DEPTH_INTRA_NAME + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
-        std::string virtualDepthImg_path =  strCommonPath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_NAME + ".tiff";
+        std::string virtualDepthImg_path = strCommonPath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_NAME + ".tiff";
         std::string virtualDepthColorImg_path = strCommonPath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_COLOR_NAME + ".png";
         std::string refDepthImg_path = m_strRootPath + LF_BEHAIRMODEL_FOLDER_NAME + "ref-csad-rd.tiff";
         std::string focuseImg_Path = strCommonPath + strFrameName + "_" + LF_FOUCSIMAGE_NAME + ".png";
@@ -6918,6 +7083,10 @@ void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameNam
             focusImage.empty() || virtualDepthColorImg.empty())
         {
             std::cout << "manual mode input image is empty!" << std::endl;
+            std::cout << "virtualDepthImg_path: " << virtualDepthImg_path << std::endl;
+            std::cout << "refDepthImg_path: " << refDepthImg_path << std::endl;
+            std::cout << "focuseImg_Path: " << focuseImg_Path << std::endl;
+            std::cout << "virtualDepthColorImg_path: " << virtualDepthColorImg_path << std::endl;
             return;
         }
 
@@ -6949,26 +7118,18 @@ void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameNam
         InitManualImageViewState(state.focusViewState, state.refFocusBase.size());
         InitManualImageViewState(state.virtualViewState, state.virtualColorBase.size());
 
-        state.refFocusShow = state.refFocusBase.clone();
-        state.virtualColorShow = state.virtualColorBase.clone();
-        state.infoPanel = cv::Mat(1100, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
-
         state.outputTxtPath = m_strRootPath + "/behavior_model/manual_vd_ref_pairs.txt";
         state.outputScatterPath = m_strRootPath + "/behavior_model/manual_vd_ref_scatter.png";
         state.outputFocusMarkedPath = m_strRootPath + "/behavior_model/manual_ref_focus_marked.png";
         state.outputVirtualMarkedPath = m_strRootPath + "/behavior_model/manual_virtual_marked.png";
 
-        cv::namedWindow("FocusImage", cv::WINDOW_NORMAL);
-        cv::namedWindow("VirtualDepthColor", cv::WINDOW_NORMAL);
-        cv::namedWindow("InfoPanel", cv::WINDOW_NORMAL);
+        cv::namedWindow("FocusImage", cv::WINDOW_AUTOSIZE);
+        cv::namedWindow("VirtualDepthColor", cv::WINDOW_AUTOSIZE);
+        cv::namedWindow("InfoPanel", cv::WINDOW_AUTOSIZE);
 
         cv::moveWindow("FocusImage", 50, 50);
         cv::moveWindow("VirtualDepthColor", 1050, 50);
         cv::moveWindow("InfoPanel", 50, 850);
-
-        cv::resizeWindow("FocusImage", 950, 750);
-        cv::resizeWindow("VirtualDepthColor", 950, 750);
-        cv::resizeWindow("InfoPanel", 1400, 1100);
 
         cv::setMouseCallback("FocusImage", OnMouseFocus, nullptr);
         cv::setMouseCallback("VirtualDepthColor", OnMouseVirtual, nullptr);
@@ -6979,6 +7140,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameNam
         while (true)
         {
             int key = cv::waitKey(30);
+
             if (key == 27) // ESC
             {
                 break;
@@ -6997,7 +7159,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameNam
 
         SaveManualPairsAndScatter();
 
-        // Step2: 用 manual 选出来并通过 RMSE 过滤后的均值点对参与拟合
         FitManualBehaviorModelAndWriteXml(this);
 
         cv::Mat refMarkedFull, virtualMarkedFull;
