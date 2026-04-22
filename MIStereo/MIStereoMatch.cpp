@@ -52,7 +52,7 @@ namespace LFMVS
             }
         }
 
-        strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+        strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
         boost::filesystem::path dir_save_path_MLA(strMLAResultFolder);
         if (!boost::filesystem::exists(dir_save_path_MLA))
         {
@@ -157,7 +157,7 @@ namespace LFMVS
             }
         }
 
-        strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+        strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
         boost::filesystem::path dir_save_path_MLA(strMLAResultFolder);
         if (!boost::filesystem::exists(dir_save_path_MLA))
         {
@@ -375,7 +375,7 @@ namespace LFMVS
             //
             //         // 创建路径
             //         std::string strMLAResultFolder  = strRootPath + LF_DEPTH_INTRA_NAME + strFrameName;
-            //         std::string strMLADisFolder = strMLAResultFolder + LF_MVS_RESULT_DATA_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
+            //         std::string strMLADisFolder = strMLAResultFolder + MVS_RESULT_DATA_FOLDER_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
             //         boost::filesystem::path dir_save_path(strMLADisFolder);
             //         if (!boost::filesystem::exists(dir_save_path))
             //         {
@@ -565,7 +565,7 @@ namespace LFMVS
         if (g_Debug_Static >= 1)
         {
             MICycleCheckStats stats;
-            std::string str_chenck_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME + strFrameName + LF_MVS_RESULT_DATA_NAME +"CycleCheck";
+            std::string str_chenck_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME + strFrameName + MVS_RESULT_DATA_FOLDER_NAME +"CycleCheck";
             MICycleCheckerCPU checker(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
 
             MICycleClampConfig ccfg;
@@ -585,7 +585,7 @@ namespace LFMVS
 
             // ② 随机匹配可视化（跨图连线严格复用上一轮随机点）
             std::string str_chenck_save_root_match = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-            + strFrameName + LF_MVS_RESULT_DATA_NAME +"CycleCheck/Match";
+            + strFrameName + MVS_RESULT_DATA_FOLDER_NAME +"CycleCheck/Match";
             checker.VisualizeRandomMatchesGlobal(strFrameName, MLA_info_map, problems_map, disNormals_map,
                                 8, 50, 4, str_chenck_save_root_match,
                                 12345, true);
@@ -614,7 +614,7 @@ namespace LFMVS
 
         MIDisparityFilterStats filter_stats;
         std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-                    + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
+                    + strFrameName + MVS_RESULT_DATA_FOLDER_NAME + "CycleCheck/Filter";
         MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
         filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
                             disNormals_map, fcfg, filter_stats,
@@ -666,31 +666,31 @@ namespace LFMVS
         adapt_frame.ReleaseMemory();
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // ② 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
-        MIDisparityFilterConfig fcfg;
-        fcfg.max_triplet = 4;
-        fcfg.min_valid_disp = 0.0f;
-        fcfg.use_selected_views_only = true;
-        fcfg.clear_selected_views_when_invalid = true;
-        fcfg.enable_cost_filter = true;
-        fcfg.max_cost = 1.8f;
-        fcfg.enable_cycle_geo_filter = true;
-        fcfg.max_geo_err_px = 0.5;
-        fcfg.enable_cycle_photo_filter = true;
-        fcfg.max_photo_err_u = 0.5;
-        fcfg.min_good_neighbors = 2;
-        fcfg.enable_spike_filter = true;
-        fcfg.spike_abs_diff = 1.0f;
-        fcfg.spike_min_neighbors = 3;
-        fcfg.dump_debug_mask = (g_Debug_Static >= 1);
-
-        MIDisparityFilterStats filter_stats;
-        std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-                    + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
-        MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
-        filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
-                            disNormals_map, fcfg, filter_stats,
-                               str_filter_save_root);
+        // // ② 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
+        // MIDisparityFilterConfig fcfg;
+        // fcfg.max_triplet = 4;
+        // fcfg.min_valid_disp = 0.0f;
+        // fcfg.use_selected_views_only = true;
+        // fcfg.clear_selected_views_when_invalid = true;
+        // fcfg.enable_cost_filter = true;
+        // fcfg.max_cost = 1.8f;
+        // fcfg.enable_cycle_geo_filter = true;
+        // fcfg.max_geo_err_px = 0.5;
+        // fcfg.enable_cycle_photo_filter = true;
+        // fcfg.max_photo_err_u = 0.5;
+        // fcfg.min_good_neighbors = 2;
+        // fcfg.enable_spike_filter = true;
+        // fcfg.spike_abs_diff = 1.0f;
+        // fcfg.spike_min_neighbors = 3;
+        // fcfg.dump_debug_mask = (g_Debug_Static >= 1);
+        //
+        // MIDisparityFilterStats filter_stats;
+        // std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
+        //             + strFrameName + MVS_RESULT_DATA_FOLDER_NAME + "CycleCheck/Filter";
+        // MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
+        // filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
+        //                     disNormals_map, fcfg, filter_stats,
+        //                        str_filter_save_root);
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews, End");
     }
@@ -736,8 +736,26 @@ namespace LFMVS
         adapt_frame_ACMM.RunPatchMatchCUDAForFrameACMM();
         adapt_frame_ACMM.WriteBackResults(disNormals_map);
         adapt_frame_ACMM.ReleaseMemory();
+        LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews_ACMM, End");
+    }
 
-        // ② 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
+    // 基于闭环一致性结果，立即剔除视差队列中的坏点/噪点，供后续虚拟深度图生成直接使用
+    void MIStereoMatch::FilterAndStatic(QuadTreeProblemMapMap::iterator& itrFrame)
+    {
+        QuadTreeTileInfoMap& MLA_info_map = m_ptrDepthSolver->GetMLAInfoMap();
+        LightFieldParams& params = m_ptrDepthSolver->GetLightFieldParams();
+
+        std::string strFrameName = itrFrame->first;
+        QuadTreeProblemMap& problems_map = itrFrame->second;
+        QuadTreeDisNormalMapMap& disNormalMapMap = m_ptrDepthSolver->GetMLADisNormalMapMap();
+        QuadTreeDisNormalMapMap::iterator itrDis = disNormalMapMap.find(strFrameName);
+        if (itrDis == disNormalMapMap.end())
+        {
+            LOG_ERROR("DisNormalMap not find = ", strFrameName.c_str());
+            return;
+        }
+        QuadTreeDisNormalMap& disNormals_map = itrDis->second;
+
         MIDisparityFilterConfig fcfg;
         fcfg.max_triplet = 4;
         fcfg.min_valid_disp = 0.0f;
@@ -746,9 +764,9 @@ namespace LFMVS
         fcfg.enable_cost_filter = true;
         fcfg.max_cost = 1.8f;
         fcfg.enable_cycle_geo_filter = true;
-        fcfg.max_geo_err_px = 0.5;
+        fcfg.max_geo_err_px = 0.5; // 误差为3.0px
         fcfg.enable_cycle_photo_filter = true;
-        fcfg.max_photo_err_u = 0.5;
+        fcfg.max_photo_err_u = 0.5; // 误差为3.0px
         fcfg.min_good_neighbors = 2;
         fcfg.enable_spike_filter = true;
         fcfg.spike_abs_diff = 1.0f;
@@ -756,12 +774,12 @@ namespace LFMVS
         fcfg.dump_debug_mask = 0; // (g_Debug_Static >= 1)
 
         fcfg.dump_disp_error_map   = true;
-        fcfg.disp_error_thresh_px  = 0.5f;
-        fcfg.disp_error_vis_max_px = 2.0f;
+        fcfg.disp_error_thresh_px  = 3.0f; // 误差为3.0px
+        fcfg.disp_error_vis_max_px = 3.0f;
 
         MIDisparityFilterStats filter_stats;
         std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-                    + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
+                    + strFrameName + MVS_RESULT_DATA_FOLDER_NAME + "CycleCheck/Filter";
         MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
         filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
                             disNormals_map, fcfg, filter_stats,
@@ -772,7 +790,6 @@ namespace LFMVS
           " rmse=", filter_stats.rmse_disp_error_px,
           " p90=", filter_stats.p90_disp_error_px,
           " thresh=", fcfg.disp_error_thresh_px);
-        LOG_ERROR("MISM: StereoMatchingForMIA_FrameCrossViews_ACMM, End");
     }
 
     void MIStereoMatch::StereoMatchingForMIA_SoftProxyPGRRepair(QuadTreeProblemMapMap::iterator& itrFrame)
@@ -1058,7 +1075,7 @@ namespace LFMVS
 
         MIDisparityFilterStats filter_stats;
         std::string str_filter_save_root = m_ptrDepthSolver->GetRootPath() + LF_DEPTH_INTRA_NAME
-                    + strFrameName + LF_MVS_RESULT_DATA_NAME + "CycleCheck/Filter";
+                    + strFrameName + MVS_RESULT_DATA_FOLDER_NAME + "CycleCheck/Filter";
         MIDisparityFilterCPU filter_cpu(params.mi_width_for_match, params.mi_height_for_match, params.baseline);
         filter_cpu.FilterGlobal(strFrameName, MLA_info_map, problems_map,
                             disNormals_map, fcfg, filter_stats,
