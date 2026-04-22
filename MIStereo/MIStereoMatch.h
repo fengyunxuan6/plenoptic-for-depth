@@ -34,6 +34,8 @@ namespace LFMVS
         // 匹配块补充（替换）+ 传播路径补充: softProxy and Propagation Graph Repair(边缘区域不完整Patch和传播路径的修复)
         void StereoMatchingForMIA_SoftProxyPGRRepair(QuadTreeProblemMapMap::iterator& itrFrame);
 
+        void FilterAndStatic(QuadTreeProblemMapMap::iterator& itrFrame);
+
     private:
         void TestWriteDisparityImage(std::string& strFrameName, QuadTreeTileKeyPtr ptrKey, AdaptMIPM& adapt_MIPM);
         void TestWriteDisparityImage_PRG(std::string& strFrameName, QuadTreeTileKeyPtr ptrKey, AdaptMIPM& adapt_MIPM);
