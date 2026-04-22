@@ -1,6 +1,9 @@
-//
-// Created by wdy on 25-10-17.
-//
+/********************************************************************
+file base:      VirtualToRealDepthFunc.cpp
+author:         LZD XYY
+created:        2026/03/04
+purpose:
+*********************************************************************/
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <string>
@@ -5948,46 +5951,49 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         return out;
     }
 
-    void RefreshInfoPanel()
+void RefreshInfoPanel()
     {
         ManualUIState& state = GetManualUIState();
 
-        state.infoPanel = cv::Mat(1100, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
+        const int panelWidth = 1400;
+        const int panelHeight = 1100;
+        const int scrollBarWidth = 18;
+        const int scrollBarMargin = 8;
+        const int trackTop = 165;
+        const int trackBottomMargin = 20;
+        const int contentRightSafe = panelWidth - scrollBarWidth - scrollBarMargin * 3;
 
-        cv::putText(state.infoPanel, "Manual Pair Selection", cv::Point(20, 35),
+        int maxPointLinesToShow = 10;
+
+        int estimatedContentHeight = 190 +
+                                     static_cast<int>(state.selections.size()) * ((maxPointLinesToShow + 4) * 22 + 30);
+        estimatedContentHeight = std::max(panelHeight, estimatedContentHeight + 40);
+
+        cv::Mat content(estimatedContentHeight, panelWidth, CV_8UC3, cv::Scalar(255, 255, 255));
+
+        cv::putText(content, "Manual Pair Selection", cv::Point(20, 35),
                     cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 0), 2);
 
-        cv::putText(state.infoPanel,
-                    "Controls: Left click add circle   Right click or Z/U undo   ESC quit+save   Mouse wheel on InfoPanel to scroll",
-                    cv::Point(20, 70), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(20, 20, 20), 1);
+        cv::putText(content,
+                    "Controls: Left click add circle | Right click or Z/U undo | Mouse wheel on image = zoom | Middle drag = pan | InfoPanel wheel / drag scrollbar = scroll",
+                    cv::Point(20, 70), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(20, 20, 20), 1);
 
-        cv::putText(state.infoPanel, "Left column: VD values / VD RMSE", cv::Point(20, 110),
+        cv::putText(content, "Left column: VD values / VD RMSE", cv::Point(20, 110),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(160, 0, 0), 2);
-        cv::putText(state.infoPanel, "Right column: REF values / REF RMSE", cv::Point(720, 110),
+        cv::putText(content, "Right column: REF values / REF RMSE", cv::Point(720, 110),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 100, 0), 2);
 
         std::string summary =
                 "Selections: " + std::to_string(state.selections.size()) +
                 "   Kept pairs(mean vd, mean ref): " + std::to_string(state.pairRecords.size()) +
                 "   Circle radius: " + std::to_string(state.circleRadius) +
-                "   ScrollOffset: " + std::to_string(state.infoScrollOffset);
-        cv::putText(state.infoPanel, summary, cv::Point(20, 145),
+                "   ScrollPx: " + std::to_string(state.infoScrollPx);
+        cv::putText(content, summary, cv::Point(20, 145),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(40, 40, 40), 1);
-
-        int visibleSelections = 3;
-        int totalSelections = static_cast<int>(state.selections.size());
-        int maxOffset = std::max(0, totalSelections - visibleSelections);
-        if (state.infoScrollOffset > maxOffset)
-            state.infoScrollOffset = maxOffset;
-        if (state.infoScrollOffset < 0)
-            state.infoScrollOffset = 0;
-
-        int startRow = state.infoScrollOffset;
-        int endRow = std::min(totalSelections, startRow + visibleSelections);
 
         int y = 185;
 
-        for (int i = startRow; i < endRow; ++i)
+        for (int i = 0; i < static_cast<int>(state.selections.size()); ++i)
         {
             const ManualSelectionRecord& rec = state.selections[i];
             int validPairCount = static_cast<int>(rec.pairEnd - rec.pairBegin);
@@ -5999,22 +6005,21 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                     " n=" + std::to_string(rec.circlePoints.size()) +
                     " kept=" + std::to_string(validPairCount);
 
-            cv::putText(state.infoPanel, title, cv::Point(20, y),
+            cv::putText(content, title, cv::Point(20, y),
                         cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(0, 0, 0), 1);
             y += 26;
 
-            int maxPointLinesToShow = 10;
             int detailStartY = y;
 
             for (int k = 0; k < static_cast<int>(rec.vdPointLines.size()) && k < maxPointLinesToShow; ++k)
             {
-                cv::putText(state.infoPanel, rec.vdPointLines[k], cv::Point(40, detailStartY + k * 22),
+                cv::putText(content, rec.vdPointLines[k], cv::Point(40, detailStartY + k * 22),
                             cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
             }
 
             for (int k = 0; k < static_cast<int>(rec.refPointLines.size()) && k < maxPointLinesToShow; ++k)
             {
-                cv::putText(state.infoPanel, rec.refPointLines[k], cv::Point(720, detailStartY + k * 22),
+                cv::putText(content, rec.refPointLines[k], cv::Point(720, detailStartY + k * 22),
                             cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
             }
 
@@ -6022,7 +6027,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
             {
                 std::string moreLeft =
                         "... " + std::to_string(rec.vdPointLines.size() - maxPointLinesToShow) + " more vd points";
-                cv::putText(state.infoPanel, moreLeft, cv::Point(40, detailStartY + maxPointLinesToShow * 22),
+                cv::putText(content, moreLeft, cv::Point(40, detailStartY + maxPointLinesToShow * 22),
                             cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
             }
 
@@ -6030,7 +6035,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
             {
                 std::string moreRight =
                         "... " + std::to_string(rec.refPointLines.size() - maxPointLinesToShow) + " more ref points";
-                cv::putText(state.infoPanel, moreRight, cv::Point(720, detailStartY + maxPointLinesToShow * 22),
+                cv::putText(content, moreRight, cv::Point(720, detailStartY + maxPointLinesToShow * 22),
                             cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
             }
 
@@ -6038,60 +6043,324 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
 
             std::string leftRmse =
                     "VD  : count=" + std::to_string(rec.vdValues.size()) +
-                    "  mean=" + std::to_string(ComputeMeanFromValidValues(rec.vdValues)) +
-                    "  rmse=" + std::to_string(rec.vdRmse);
+                    "  mean=" + std::string(cv::format("%.6f", ComputeMeanFromValidValues(rec.vdValues))) +
+                    "  rmse=" + std::string(cv::format("%.6f", rec.vdRmse));
 
             std::string rightRmse =
                     "REF : count=" + std::to_string(rec.refValues.size()) +
-                    "  mean=" + std::to_string(ComputeMeanFromValidValues(rec.refValues)) +
-                    "  rmse=" + std::to_string(rec.refRmse);
+                    "  mean=" + std::string(cv::format("%.6f", ComputeMeanFromValidValues(rec.refValues))) +
+                    "  rmse=" + std::string(cv::format("%.6f", rec.refRmse));
 
-            cv::putText(state.infoPanel, leftRmse, cv::Point(40, y),
+            cv::putText(content, leftRmse, cv::Point(40, y),
                         cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(160, 0, 0), 1);
 
-            cv::putText(state.infoPanel, rightRmse, cv::Point(720, y),
+            cv::putText(content, rightRmse, cv::Point(720, y),
                         cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(0, 120, 0), 1);
 
             y += 42;
 
-            if (y > state.infoPanel.rows - 40)
-                break;
+            cv::line(content, cv::Point(20, y - 18), cv::Point(contentRightSafe, y - 18),
+                     cv::Scalar(220, 220, 220), 1);
+
+            y += 10;
+        }
+
+        int contentHeight = std::max(panelHeight, y + 20);
+        if (content.rows != contentHeight)
+            content = content.rowRange(0, contentHeight).clone();
+
+        state.infoContentHeight = contentHeight;
+
+        int maxScrollPx = std::max(0, contentHeight - panelHeight);
+        state.infoScrollPx = std::max(0, std::min(maxScrollPx, state.infoScrollPx));
+
+        state.infoPanel = cv::Mat(panelHeight, panelWidth, CV_8UC3, cv::Scalar(255, 255, 255));
+        content(cv::Rect(0, state.infoScrollPx, panelWidth, panelHeight)).copyTo(state.infoPanel);
+
+        state.infoScrollTrackRect = cv::Rect();
+        state.infoScrollThumbRect = cv::Rect();
+
+        if (maxScrollPx > 0)
+        {
+            int trackHeight = panelHeight - trackTop - trackBottomMargin;
+            int trackX = panelWidth - scrollBarWidth - scrollBarMargin;
+            int trackY = trackTop;
+
+            state.infoScrollTrackRect = cv::Rect(trackX, trackY, scrollBarWidth, trackHeight);
+
+            double visibleRatio = static_cast<double>(panelHeight) / static_cast<double>(contentHeight);
+            int thumbHeight = std::max(60, static_cast<int>(std::round(trackHeight * visibleRatio)));
+            thumbHeight = std::min(trackHeight, thumbHeight);
+
+            int movableRange = std::max(1, trackHeight - thumbHeight);
+            int thumbY = trackY + static_cast<int>(
+                    std::round(movableRange * static_cast<double>(state.infoScrollPx) / static_cast<double>(maxScrollPx)));
+
+            state.infoScrollThumbRect = cv::Rect(trackX, thumbY, scrollBarWidth, thumbHeight);
+
+            cv::rectangle(state.infoPanel, state.infoScrollTrackRect, cv::Scalar(235, 235, 235), cv::FILLED);
+            cv::rectangle(state.infoPanel, state.infoScrollTrackRect, cv::Scalar(180, 180, 180), 1);
+
+            cv::rectangle(state.infoPanel, state.infoScrollThumbRect, cv::Scalar(150, 150, 150), cv::FILLED);
+            cv::rectangle(state.infoPanel, state.infoScrollThumbRect, cv::Scalar(100, 100, 100), 1);
+        }
+
+        cv::imshow("InfoPanel", state.infoPanel);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////
+
+    void InitManualImageViewState(ManualImageViewState& viewState, const cv::Size& size)
+    {
+        viewState.scale = 1.0;
+        viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
+        viewState.middleDragging = false;
+        viewState.lastMouse = cv::Point(-1, -1);
+    }
+
+    void ClampManualImageViewState(ManualImageViewState& viewState, const cv::Size& size)
+    {
+        if (size.width <= 0 || size.height <= 0)
+            return;
+
+        if (viewState.center.x < 0.0 || viewState.center.y < 0.0)
+        {
+            viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
+        }
+
+        if (viewState.scale <= 1.0)
+        {
+            viewState.center = cv::Point2d((size.width - 1) * 0.5, (size.height - 1) * 0.5);
+            return;
+        }
+
+        int roiW = std::max(1, static_cast<int>(std::round(size.width / viewState.scale)));
+        int roiH = std::max(1, static_cast<int>(std::round(size.height / viewState.scale)));
+
+        double halfW = roiW * 0.5;
+        double halfH = roiH * 0.5;
+
+        double minCx = halfW;
+        double maxCx = std::max(minCx, static_cast<double>(size.width) - halfW);
+        double minCy = halfH;
+        double maxCy = std::max(minCy, static_cast<double>(size.height) - halfH);
+
+        viewState.center.x = std::max(minCx, std::min(maxCx, viewState.center.x));
+        viewState.center.y = std::max(minCy, std::min(maxCy, viewState.center.y));
+    }
+
+    cv::Rect BuildManualViewRoi(const ManualImageViewState& viewState, const cv::Size& size)
+    {
+        int roiW = std::max(1, static_cast<int>(std::round(size.width / std::max(1.0, viewState.scale))));
+        int roiH = std::max(1, static_cast<int>(std::round(size.height / std::max(1.0, viewState.scale))));
+
+        int x = static_cast<int>(std::round(viewState.center.x - roiW * 0.5));
+        int y = static_cast<int>(std::round(viewState.center.y - roiH * 0.5));
+
+        x = std::max(0, std::min(x, std::max(0, size.width - roiW)));
+        y = std::max(0, std::min(y, std::max(0, size.height - roiH)));
+
+        return cv::Rect(x, y, roiW, roiH);
+    }
+
+    void RenderManualZoomedImage(const cv::Mat& src,
+                                 const ManualImageViewState& viewState,
+                                 cv::Mat& dst)
+    {
+        if (src.empty())
+        {
+            dst.release();
+            return;
+        }
+
+        dst = cv::Mat(src.size(), src.type(), cv::Scalar::all(30));
+
+        if (viewState.scale <= 1.0)
+        {
+            int scaledW = std::max(1, static_cast<int>(std::round(src.cols * viewState.scale)));
+            int scaledH = std::max(1, static_cast<int>(std::round(src.rows * viewState.scale)));
+
+            cv::Mat small;
+            cv::resize(src, small, cv::Size(scaledW, scaledH), 0.0, 0.0, cv::INTER_AREA);
+
+            int offX = (dst.cols - scaledW) / 2;
+            int offY = (dst.rows - scaledH) / 2;
+
+            cv::Rect pasteRoi(offX, offY, scaledW, scaledH);
+            small.copyTo(dst(pasteRoi));
+        }
+        else
+        {
+            ManualImageViewState tmpState = viewState;
+            ClampManualImageViewState(tmpState, src.size());
+            cv::Rect roi = BuildManualViewRoi(tmpState, src.size());
+
+            cv::Mat cropped = src(roi);
+            cv::resize(cropped, dst, src.size(), 0.0, 0.0, cv::INTER_LINEAR);
+        }
+
+        std::string scaleText = "Scale: " + std::string(cv::format("%.2fx", viewState.scale));
+        cv::putText(dst, scaleText, cv::Point(20, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    }
+
+    bool MapDisplayPointToManualImage(const cv::Point& displayPt,
+                                      const cv::Size& imageSize,
+                                      const ManualImageViewState& viewState,
+                                      cv::Point& imagePt)
+    {
+        if (imageSize.width <= 0 || imageSize.height <= 0)
+            return false;
+
+        if (displayPt.x < 0 || displayPt.y < 0 ||
+            displayPt.x >= imageSize.width || displayPt.y >= imageSize.height)
+            return false;
+
+        if (viewState.scale <= 1.0)
+        {
+            int scaledW = std::max(1, static_cast<int>(std::round(imageSize.width * viewState.scale)));
+            int scaledH = std::max(1, static_cast<int>(std::round(imageSize.height * viewState.scale)));
+            int offX = (imageSize.width - scaledW) / 2;
+            int offY = (imageSize.height - scaledH) / 2;
+
+            if (displayPt.x < offX || displayPt.x >= offX + scaledW ||
+                displayPt.y < offY || displayPt.y >= offY + scaledH)
+                return false;
+
+            double localX = static_cast<double>(displayPt.x - offX) / std::max(1, scaledW - 1);
+            double localY = static_cast<double>(displayPt.y - offY) / std::max(1, scaledH - 1);
+
+            int srcX = static_cast<int>(std::round(localX * (imageSize.width - 1)));
+            int srcY = static_cast<int>(std::round(localY * (imageSize.height - 1)));
+
+            srcX = std::max(0, std::min(imageSize.width - 1, srcX));
+            srcY = std::max(0, std::min(imageSize.height - 1, srcY));
+
+            imagePt = cv::Point(srcX, srcY);
+            return true;
+        }
+        else
+        {
+            ManualImageViewState tmpState = viewState;
+            ClampManualImageViewState(tmpState, imageSize);
+            cv::Rect roi = BuildManualViewRoi(tmpState, imageSize);
+
+            double localX = static_cast<double>(displayPt.x) / std::max(1, imageSize.width - 1);
+            double localY = static_cast<double>(displayPt.y) / std::max(1, imageSize.height - 1);
+
+            int srcX = roi.x + static_cast<int>(std::round(localX * (roi.width - 1)));
+            int srcY = roi.y + static_cast<int>(std::round(localY * (roi.height - 1)));
+
+            srcX = std::max(0, std::min(imageSize.width - 1, srcX));
+            srcY = std::max(0, std::min(imageSize.height - 1, srcY));
+
+            imagePt = cv::Point(srcX, srcY);
+            return true;
         }
     }
 
-    void RefreshManualWindows()
+    void ZoomManualImageView(ManualImageViewState& viewState,
+                             const cv::Size& imageSize,
+                             const cv::Point& displayPt,
+                             int wheelDelta)
+    {
+        if (imageSize.width <= 0 || imageSize.height <= 0)
+            return;
+
+        cv::Point imagePt;
+        bool hasAnchor = MapDisplayPointToManualImage(displayPt, imageSize, viewState, imagePt);
+
+        double zoomFactor = (wheelDelta > 0) ? 1.20 : (1.0 / 1.20);
+        double newScale = viewState.scale * zoomFactor;
+        newScale = std::max(viewState.minScale, std::min(viewState.maxScale, newScale));
+
+        if (std::fabs(newScale - viewState.scale) < 1e-12)
+            return;
+
+        viewState.scale = newScale;
+
+        if (hasAnchor)
+        {
+            viewState.center = cv::Point2d(imagePt.x, imagePt.y);
+        }
+
+        ClampManualImageViewState(viewState, imageSize);
+    }
+
+    void PanManualImageView(ManualImageViewState& viewState,
+                            const cv::Size& imageSize,
+                            const cv::Point& currentMouse)
+    {
+        if (viewState.scale <= 1.0)
+            return;
+
+        if (viewState.lastMouse.x < 0 || viewState.lastMouse.y < 0)
+        {
+            viewState.lastMouse = currentMouse;
+            return;
+        }
+
+        ManualImageViewState tmpState = viewState;
+        ClampManualImageViewState(tmpState, imageSize);
+        cv::Rect roi = BuildManualViewRoi(tmpState, imageSize);
+
+        double dxWin = static_cast<double>(currentMouse.x - viewState.lastMouse.x);
+        double dyWin = static_cast<double>(currentMouse.y - viewState.lastMouse.y);
+
+        double dxImg = dxWin * roi.width / std::max(1, imageSize.width);
+        double dyImg = dyWin * roi.height / std::max(1, imageSize.height);
+
+        viewState.center.x -= dxImg;
+        viewState.center.y -= dyImg;
+        viewState.lastMouse = currentMouse;
+
+        ClampManualImageViewState(viewState, imageSize);
+    }
+
+    void BuildAnnotatedManualImages(cv::Mat& refAnnotated,
+                                    cv::Mat& virtualAnnotated)
     {
         ManualUIState& state = GetManualUIState();
 
-        state.refFocusShow = state.refFocusBase.clone();
-        state.virtualColorShow = state.virtualColorBase.clone();
+        refAnnotated = state.refFocusBase.clone();
+        virtualAnnotated = state.virtualColorBase.clone();
 
         for (size_t i = 0; i < state.selections.size(); ++i)
         {
             const ManualSelectionRecord& rec = state.selections[i];
             cv::Scalar color = (i + 1 == state.selections.size()) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
 
-            cv::circle(state.refFocusShow, rec.center, state.circleRadius, color, 2);
-            cv::circle(state.refFocusShow, rec.center, 3, cv::Scalar(255, 0, 0), -1);
+            cv::circle(refAnnotated, rec.center, state.circleRadius, color, 2);
+            cv::circle(refAnnotated, rec.center, 3, cv::Scalar(255, 0, 0), -1);
 
-            cv::circle(state.virtualColorShow, rec.center, state.circleRadius, color, 2);
-            cv::circle(state.virtualColorShow, rec.center, 3, cv::Scalar(255, 0, 0), -1);
+            cv::circle(virtualAnnotated, rec.center, state.circleRadius, color, 2);
+            cv::circle(virtualAnnotated, rec.center, 3, cv::Scalar(255, 0, 0), -1);
 
             std::string idx = std::to_string(static_cast<int>(i + 1));
-            cv::putText(state.refFocusShow, idx, rec.center + cv::Point(5, -5),
+            cv::putText(refAnnotated, idx, rec.center + cv::Point(5, -5),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
-            cv::putText(state.virtualColorShow, idx, rec.center + cv::Point(5, -5),
+            cv::putText(virtualAnnotated, idx, rec.center + cv::Point(5, -5),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
         }
-
         if (state.hoverValid)
         {
             std::string hoverText =
-                    "hover ref mean = " + std::to_string(state.hoverRefMean) +
+                    "hover ref mean = " + std::string(cv::format("%.3f", state.hoverRefMean)) +
                     "  at (" + std::to_string(state.hoverPoint.x) + "," + std::to_string(state.hoverPoint.y) + ")";
-            cv::putText(state.refFocusShow, hoverText, cv::Point(30, 100),
+            cv::putText(refAnnotated, hoverText, cv::Point(30, 100),
                         cv::FONT_HERSHEY_SIMPLEX, 4, cv::Scalar(255, 0, 255), 4);
         }
+    }
+    //////////////////////////////////////////////////////////////////////////////////////
+    void RefreshManualWindows()
+    {
+        ManualUIState& state = GetManualUIState();
+
+        cv::Mat refAnnotated, virtualAnnotated;
+        BuildAnnotatedManualImages(refAnnotated, virtualAnnotated);
+
+        RenderManualZoomedImage(refAnnotated, state.focusViewState, state.refFocusShow);
+        RenderManualZoomedImage(virtualAnnotated, state.virtualViewState, state.virtualColorShow);
 
         RefreshInfoPanel();
 
@@ -6180,16 +6449,56 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         RefreshManualWindows();
     }
 
-    void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
+ void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
     {
-        (void)flags;
         (void)userdata;
 
         ManualUIState& state = GetManualUIState();
 
+        if (event == cv::EVENT_MOUSEWHEEL)
+        {
+            int delta = cv::getMouseWheelDelta(flags);
+            if (delta != 0)
+            {
+                ZoomManualImageView(state.focusViewState,
+                                    state.refDepth32F.size(),
+                                    cv::Point(x, y),
+                                    delta);
+                RefreshManualWindows();
+            }
+            return;
+        }
+
+        if (event == cv::EVENT_MBUTTONDOWN)
+        {
+            state.focusViewState.middleDragging = true;
+            state.focusViewState.lastMouse = cv::Point(x, y);
+            return;
+        }
+
+        if (event == cv::EVENT_MBUTTONUP)
+        {
+            state.focusViewState.middleDragging = false;
+            state.focusViewState.lastMouse = cv::Point(-1, -1);
+            return;
+        }
+
+        if (event == cv::EVENT_MOUSEMOVE && state.focusViewState.middleDragging)
+        {
+            PanManualImageView(state.focusViewState,
+                               state.refDepth32F.size(),
+                               cv::Point(x, y));
+            RefreshManualWindows();
+            return;
+        }
+
         if (event == cv::EVENT_MOUSEMOVE)
         {
-            if (x < 0 || y < 0 || x >= state.refDepth32F.cols || y >= state.refDepth32F.rows)
+            cv::Point imgPt;
+            if (!MapDisplayPointToManualImage(cv::Point(x, y),
+                                              state.refDepth32F.size(),
+                                              state.focusViewState,
+                                              imgPt))
                 return;
 
             auto now = std::chrono::steady_clock::now();
@@ -6203,12 +6512,11 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - state.lastHoverUpdateTime).count();
 
-            // 距离上次更新时间不足 5 秒，不重算
             if (elapsedMs < 3000)
                 return;
 
             state.lastHoverUpdateTime = now;
-            state.hoverPoint = cv::Point(x, y);
+            state.hoverPoint = imgPt;
 
             std::vector<cv::Point> hoverCircle =
                     CollectCirclePoints(state.hoverPoint, state.circleRadius, state.refDepth32F.size());
@@ -6217,10 +6525,19 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
             state.hoverValid = true;
 
             RefreshManualWindows();
+            return;
         }
-        else if (event == cv::EVENT_LBUTTONDOWN)
+
+        if (event == cv::EVENT_LBUTTONDOWN)
         {
-            HandleManualClick(x, y, "Focus");
+            cv::Point imgPt;
+            if (MapDisplayPointToManualImage(cv::Point(x, y),
+                                             state.refDepth32F.size(),
+                                             state.focusViewState,
+                                             imgPt))
+            {
+                HandleManualClick(imgPt.x, imgPt.y, "Focus");
+            }
         }
         else if (event == cv::EVENT_RBUTTONDOWN)
         {
@@ -6230,23 +6547,6 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
 
     void OnMouseVirtual(int event, int x, int y, int flags, void* userdata)
     {
-        (void)flags;
-        (void)userdata;
-
-        if (event == cv::EVENT_LBUTTONDOWN)
-        {
-            HandleManualClick(x, y, "Virtual");
-        }
-        else if (event == cv::EVENT_RBUTTONDOWN)
-        {
-            UndoLastManualSelection();
-        }
-    }
-
-    void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
-    {
-        (void)x;
-        (void)y;
         (void)userdata;
 
         ManualUIState& state = GetManualUIState();
@@ -6254,13 +6554,151 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         if (event == cv::EVENT_MOUSEWHEEL)
         {
             int delta = cv::getMouseWheelDelta(flags);
+            if (delta != 0)
+            {
+                ZoomManualImageView(state.virtualViewState,
+                                    state.virtualDepth32F.size(),
+                                    cv::Point(x, y),
+                                    delta);
+                RefreshManualWindows();
+            }
+            return;
+        }
 
+        if (event == cv::EVENT_MBUTTONDOWN)
+        {
+            state.virtualViewState.middleDragging = true;
+            state.virtualViewState.lastMouse = cv::Point(x, y);
+            return;
+        }
+
+        if (event == cv::EVENT_MBUTTONUP)
+        {
+            state.virtualViewState.middleDragging = false;
+            state.virtualViewState.lastMouse = cv::Point(-1, -1);
+            return;
+        }
+
+        if (event == cv::EVENT_MOUSEMOVE && state.virtualViewState.middleDragging)
+        {
+            PanManualImageView(state.virtualViewState,
+                               state.virtualDepth32F.size(),
+                               cv::Point(x, y));
+            RefreshManualWindows();
+            return;
+        }
+
+        if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            cv::Point imgPt;
+            if (MapDisplayPointToManualImage(cv::Point(x, y),
+                                             state.virtualDepth32F.size(),
+                                             state.virtualViewState,
+                                             imgPt))
+            {
+                HandleManualClick(imgPt.x, imgPt.y, "Virtual");
+            }
+        }
+        else if (event == cv::EVENT_RBUTTONDOWN)
+        {
+            UndoLastManualSelection();
+        }
+    }
+
+void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
+    {
+        (void)userdata;
+
+        ManualUIState& state = GetManualUIState();
+
+        int panelHeight = state.infoPanel.empty() ? 1100 : state.infoPanel.rows;
+        int maxScrollPx = std::max(0, state.infoContentHeight - panelHeight);
+
+        if (event == cv::EVENT_MOUSEWHEEL)
+        {
+            int delta = cv::getMouseWheelDelta(flags);
             if (delta > 0)
-                state.infoScrollOffset = std::max(0, state.infoScrollOffset - 1);
+                state.infoScrollPx = std::max(0, state.infoScrollPx - 120);
             else if (delta < 0)
-                state.infoScrollOffset += 1;
+                state.infoScrollPx = std::min(maxScrollPx, state.infoScrollPx + 120);
 
             RefreshManualWindows();
+            return;
+        }
+
+        if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            cv::Point pt(x, y);
+
+            if (state.infoScrollThumbRect.contains(pt))
+            {
+                state.infoScrollDragging = true;
+                state.infoScrollDragOffsetY = y - state.infoScrollThumbRect.y;
+                return;
+            }
+
+            if (state.infoScrollTrackRect.contains(pt) &&
+                state.infoScrollTrackRect.height > 0 &&
+                state.infoScrollThumbRect.height > 0)
+            {
+                int trackTop = state.infoScrollTrackRect.y;
+                int trackHeight = state.infoScrollTrackRect.height;
+                int thumbHeight = state.infoScrollThumbRect.height;
+                int movableRange = std::max(1, trackHeight - thumbHeight);
+
+                int targetThumbTop = y - thumbHeight / 2;
+                int localTop = std::max(0, std::min(movableRange, targetThumbTop - trackTop));
+
+                if (maxScrollPx > 0)
+                {
+                    state.infoScrollPx = static_cast<int>(
+                            std::round(static_cast<double>(localTop) / static_cast<double>(movableRange) *
+                                       static_cast<double>(maxScrollPx)));
+                }
+                else
+                {
+                    state.infoScrollPx = 0;
+                }
+
+                RefreshManualWindows();
+                return;
+            }
+        }
+
+        if (event == cv::EVENT_MOUSEMOVE && state.infoScrollDragging)
+        {
+            if (state.infoScrollTrackRect.height > 0 &&
+                state.infoScrollThumbRect.height > 0)
+            {
+                int trackTop = state.infoScrollTrackRect.y;
+                int trackHeight = state.infoScrollTrackRect.height;
+                int thumbHeight = state.infoScrollThumbRect.height;
+                int movableRange = std::max(1, trackHeight - thumbHeight);
+
+                int thumbTop = y - state.infoScrollDragOffsetY;
+                int localTop = std::max(0, std::min(movableRange, thumbTop - trackTop));
+
+                if (maxScrollPx > 0)
+                {
+                    state.infoScrollPx = static_cast<int>(
+                            std::round(static_cast<double>(localTop) / static_cast<double>(movableRange) *
+                                       static_cast<double>(maxScrollPx)));
+                }
+                else
+                {
+                    state.infoScrollPx = 0;
+                }
+
+                RefreshManualWindows();
+            }
+            return;
+        }
+
+        if (event == cv::EVENT_LBUTTONUP)
+        {
+            state.infoScrollDragging = false;
+            state.infoScrollDragOffsetY = 0;
+            return;
         }
     }
 
@@ -6457,8 +6895,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         std::cout << "DepthMax(min gt -> vd): " << depthMax << std::endl;
     }
 
-
-    void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameName)
+void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameName)
     {
         m_strRootPath = m_ptrDepthSolver->GetRootPath();
 
@@ -6506,11 +6943,15 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         float highlightDepthMin = 16000.0f;
         float highlightDepthMax = 20000.0f;
 
-        state.refFocusBase = BuildRefFocusImage(focusImage,state.refDepth32F,highlightDepthMin,highlightDepthMax);
+        state.refFocusBase = BuildRefFocusImage(focusImage, state.refDepth32F, highlightDepthMin, highlightDepthMax);
         state.virtualColorBase = virtualDepthColorImg.clone();
+
+        InitManualImageViewState(state.focusViewState, state.refFocusBase.size());
+        InitManualImageViewState(state.virtualViewState, state.virtualColorBase.size());
+
         state.refFocusShow = state.refFocusBase.clone();
         state.virtualColorShow = state.virtualColorBase.clone();
-        state.infoPanel = cv::Mat(950, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
+        state.infoPanel = cv::Mat(1100, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
 
         state.outputTxtPath = m_strRootPath + "/behavior_model/manual_vd_ref_pairs.txt";
         state.outputScatterPath = m_strRootPath + "/behavior_model/manual_vd_ref_scatter.png";
@@ -6524,6 +6965,10 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         cv::moveWindow("FocusImage", 50, 50);
         cv::moveWindow("VirtualDepthColor", 1050, 50);
         cv::moveWindow("InfoPanel", 50, 850);
+
+        cv::resizeWindow("FocusImage", 950, 750);
+        cv::resizeWindow("VirtualDepthColor", 950, 750);
+        cv::resizeWindow("InfoPanel", 1400, 1100);
 
         cv::setMouseCallback("FocusImage", OnMouseFocus, nullptr);
         cv::setMouseCallback("VirtualDepthColor", OnMouseVirtual, nullptr);
@@ -6542,6 +6987,12 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
             {
                 UndoLastManualSelection();
             }
+            else if (key == 'r')
+            {
+                InitManualImageViewState(state.focusViewState, state.refFocusBase.size());
+                InitManualImageViewState(state.virtualViewState, state.virtualColorBase.size());
+                RefreshManualWindows();
+            }
         }
 
         SaveManualPairsAndScatter();
@@ -6549,8 +7000,11 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         // Step2: 用 manual 选出来并通过 RMSE 过滤后的均值点对参与拟合
         FitManualBehaviorModelAndWriteXml(this);
 
-        cv::imwrite(state.outputFocusMarkedPath, state.refFocusShow);
-        cv::imwrite(state.outputVirtualMarkedPath, state.virtualColorShow);
+        cv::Mat refMarkedFull, virtualMarkedFull;
+        BuildAnnotatedManualImages(refMarkedFull, virtualMarkedFull);
+
+        cv::imwrite(state.outputFocusMarkedPath, refMarkedFull);
+        cv::imwrite(state.outputVirtualMarkedPath, virtualMarkedFull);
 
         std::cout << "manual pairs txt saved: " << state.outputTxtPath << std::endl;
         std::cout << "manual scatter saved: " << state.outputScatterPath << std::endl;
