@@ -465,16 +465,12 @@ namespace LFMVS
         m_MI_gray.convertTo(MI_gray_float,CV_32FC1);
         cv::filter2D(MI_gray_float,m_Image_RichnessScore_Gabor,-1,gaborKernel);
 
-        cv::imwrite("/home/lzd/work/data/plenoptic_data/2600w_1128/scene1/scene/depth_intra/8/MVSResult/kk.png", gaborKernel);
-
-        cv::imwrite("/home/lzd/work/data/plenoptic_data/2600w_1128/scene1/scene/depth_intra/8/MVSResult/gg.png", MI_gray_float);
-        cv::imwrite("/home/lzd/work/data/plenoptic_data/2600w_1128/scene1/scene/depth_intra/8/MVSResult/tt.png", m_Image_RichnessScore_Gabor);
         // 存储纹理丰富性指标结果图
         std::string strNameLessExt = itrP->first;
         m_ptrDepthSolver->SetRichnessImageMap(strNameLessExt, m_Image_RichnessScore_Gabor) ;
 
         // test
-        if(bWrite)
+        if(g_Debug_Static >= 3)
         {
             WriteQuantifiedRichnessImage(itrP, m_Image_RichnessScore_Gabor);
         }
@@ -826,7 +822,7 @@ namespace LFMVS
         QuadTreeProblemMap& problem_map = itrP->second;
 
         // 准备路径，并写出
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strNameLessExt + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strNameLessExt + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -869,36 +865,11 @@ namespace LFMVS
                 break;
         }
 
-//        std::string str_MIRichnessValue_path;
-//        switch (m_eRichnessScoreType)
-//        {
-//        case RST_GLCM:
-//            {
-//                str_MIRichnessValue_path = m_strSavePath + std::string("/richness_glcm");
-//            }
-//        case RST_Tamura:
-//            {
-//                str_MIRichnessValue_path = m_strSavePath + std::string("/richness_tamura");
-//            }
-//        case RST_Gabor:
-//            {
-//                str_MIRichnessValue_path = m_strSavePath + std::string("/richness_gabor");
-//            }
-//        case RST_LBP:
-//            {
-//                str_MIRichnessValue_path = m_strSavePath + std::string("/richness_lbp");
-//            }
-//            break;
-//            default:
-//                break;
-//        }
-
-        std::string strMI_BlurValue_gray_path = strMI_BlurValue_path + "raw.png";
-        imwrite(strMI_BlurValue_gray_path, blur_score_img_copy);
-
-//        std::string str_MIRichnessValue_gray_path = str_MIRichnessValue_path + "raw.png";
-//        imwrite(str_MIRichnessValue_gray_path, blur_score_img_copy);
-
+        if(g_Debug_Static >= 3)
+        {
+            std::string strMI_BlurValue_gray_path = strMI_BlurValue_path + "raw.png";
+            imwrite(strMI_BlurValue_gray_path, blur_score_img_copy);
+        }
 
         // 加微图像的外边缘和编号
         for(QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); itr++)
@@ -933,8 +904,12 @@ namespace LFMVS
             // 绘制圆环：根据标定的微透镜直径
             cv::circle(blur_score_img_copy, center_p, lf_Params.baseline*0.5, 255, 1);
         }
-        std::string strMI_BlurValue_gray_full_path = strMI_BlurValue_path + "raw_key.png";
-        imwrite(strMI_BlurValue_gray_full_path, blur_score_img_copy);
+
+        if(g_Debug_Static >= 3)
+        {
+            std::string strMI_BlurValue_gray_full_path = strMI_BlurValue_path + "raw_key.png";
+            imwrite(strMI_BlurValue_gray_full_path, blur_score_img_copy);
+        }
     }
 
    // void ImageQualityEstimate::WriteQuantifiedRichnessImage(QuadTreeProblemMapMap::iterator& itrP, cv::Mat_<float> richness_score_img)
@@ -950,7 +925,7 @@ namespace LFMVS
         QuadTreeProblemMap& problem_map = itrP->second;
 
         // 准备路径，并写出
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strNameLessExt + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strNameLessExt + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -994,8 +969,11 @@ namespace LFMVS
             break;
         }
 
-        std::string str_MIRichnessValue_gray_path = str_MIRichnessValue_path + "_raw.png";
-        imwrite(str_MIRichnessValue_gray_path, richness_score_img_copy);
+        if(g_Debug_Static >= 3)
+        {
+            std::string str_MIRichnessValue_gray_path = str_MIRichnessValue_path + "_raw.png";
+            imwrite(str_MIRichnessValue_gray_path, richness_score_img_copy);
+        }
 
         // 加微图像的外边缘和编号
         for(QuadTreeProblemMap::iterator itr = problem_map.begin(); itr != problem_map.end(); itr++)
@@ -1030,11 +1008,12 @@ namespace LFMVS
             // 绘制圆环：根据标定的微透镜直径
             cv::circle(richness_score_img_copy, center_p, lf_Params.baseline*0.5, 255, 1);
         }
-        std::string strMI_BlurValue_gray_full_path = str_MIRichnessValue_path + "_raw_key.png";
-        imwrite(strMI_BlurValue_gray_full_path, richness_score_img_copy);
 
-//        MISimilarityMeasure image_SM(this);
-//        image_SM.Slice_RichnessMLAImage(itrP);
+        if(g_Debug_Static >= 3)
+        {
+            std::string strMI_BlurValue_gray_full_path = str_MIRichnessValue_path + "_raw_key.png";
+            imwrite(strMI_BlurValue_gray_full_path, richness_score_img_copy);
+        }
     }
 
     //测试用的临时函数
@@ -1070,11 +1049,16 @@ namespace LFMVS
         cv::Mat tmp_img = m_Clustered_img.clone();
         cv::Mat color_map;
         cv::applyColorMap(tmp_img*80, color_map, cv::COLORMAP_JET);
-        cv::imwrite(strPath_test+"/blur_ssim_cluster_color.png", color_map);
+        if(g_Debug_Static >= 3)
+        {
+            cv::imwrite(strPath_test+"/blur_ssim_cluster_color.png", color_map);
+        }
 
         cv::convertScaleAbs(m_Clustered_img, m_Clustered_img, 255);
-
-        cv::imwrite(strPath_test+"/blur_ssim_cluster.png", m_Clustered_img);
+        if(g_Debug_Static >= 3)
+        {
+            cv::imwrite(strPath_test+"/blur_ssim_cluster.png", m_Clustered_img);
+        }
     }
 
 }
