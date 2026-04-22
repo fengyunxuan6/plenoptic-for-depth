@@ -233,7 +233,7 @@ namespace LFMVS
         }
 
         // Step5: 准备路径，并写出
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -427,7 +427,7 @@ namespace LFMVS
         }
 
         // Step5: 准备路径，并写出
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -780,7 +780,7 @@ namespace LFMVS
         }
 
         // 保存结果
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -1256,7 +1256,7 @@ namespace LFMVS
         }
 
         // 保存结果
-        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
+        m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(m_strSavePath);
             if (!boost::filesystem::exists(dir_save_path))
@@ -1415,7 +1415,7 @@ namespace LFMVS
         LOG_ERROR("LFRefocus: FuseVirtualDepth_BackProject, End");
     }
 
-    void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& itrFrame)
+void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& itrFrame)
 {
     LOG_ERROR("LFRefocus: FuseVirtualDepth_BackProject, Begin");
 
@@ -1659,7 +1659,7 @@ namespace LFMVS
     }
 
     // Step3: 准备输出目录
-    m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + LF_MVS_RESULT_DATA_NAME;
+    m_strSavePath = m_ptrDepthSolver->GetSavePath() + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
     {
         boost::filesystem::path dir_save_path(m_strSavePath);
         if (!boost::filesystem::exists(dir_save_path))
@@ -1670,20 +1670,14 @@ namespace LFMVS
     }
 
     // Step4: 保存基础结果
-    std::string strVDImagePath = m_strSavePath + "/" + LF_VIRTUALDEPTHMAP_NAME + std::string(".tiff");
+    std::string strVDImagePath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_NAME + std::string(".tiff");
     cv::imwrite(strVDImagePath, m_VirtualDepthMap);
-
-    std::string strAIFImagePath = m_strSavePath + LF_ALLINFOUCSIMAGE_NAME + std::string(".png");
+    std::string strAIFImagePath = m_strSavePath + strFrameName + "_" + LF_ALLINFOUCSIMAGE_NAME + std::string(".png");
     cv::imwrite(strAIFImagePath, m_AIF_Color);
-
-    // 原始 float 虚拟深度图
-    std::string strVDRawFloatPath = m_strSavePath + std::string("/VD_Raw_float.tiff");
-    cv::imwrite(strVDRawFloatPath, m_VirtualDepthMap);
 
     // Step5: 统计有效虚拟深度
     std::vector<float> vd_data_valid;
     vd_data_valid.reserve(image_height * image_width / 8);
-
     for (int row = 0; row < image_height; ++row)
     {
         const float* ptr = m_VirtualDepthMap.ptr<float>(row);
@@ -1736,10 +1730,9 @@ namespace LFMVS
     if (vd_valid.empty())
     {
         cv::Mat emptyGray = cv::Mat::zeros(image_height, image_width, CV_8UC1);
-        cv::Mat emptyColor(image_height, image_width, CV_8UC3, cv::Scalar(238, 238, 238));
-
-        cv::imwrite(m_strSavePath + "/VD_Raw_gray.png", emptyGray);
-        cv::imwrite(m_strSavePath + "/VD_Raw_color.png", emptyColor);
+        cv::Mat emptyColor(image_height, image_width, CV_8UC3, cv::Scalar(60, 60, 60));
+        cv::imwrite(m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_GRAY_NAME + std::string(".png"), emptyGray);
+        cv::imwrite(m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_COLOR_NAME + std::string(".png"), emptyColor);
     }
     else
     {
@@ -1753,7 +1746,7 @@ namespace LFMVS
             return data[k];
         };
 
-        // 优先在 MAD 约束范围内再做分位拉伸，显示更稳
+        // 优先在稳健范围内做显示拉伸
         std::vector<float> vd_vis;
         vd_vis.reserve(vd_valid.size());
         if (hi_global > lo_global)
@@ -1782,9 +1775,9 @@ namespace LFMVS
 
         cv::Mat VD_Gray = cv::Mat::zeros(image_height, image_width, CV_8UC1);
 
-        // 可按需要改这两个参数
-        const float gamma = 0.65f;      // <1 提亮暗部
-        const bool reverseColor = true; // true: 反转色带方向
+        // 这里别再太强提亮了，否则会继续发白
+        const float gamma = 0.90f;
+        const bool reverseColor = true;
 
         for (int row = 0; row < image_height; ++row)
         {
@@ -1811,13 +1804,19 @@ namespace LFMVS
             }
         }
 
-        std::string strVDGrayPath = m_strSavePath + std::string("/VD_Raw_gray.png");
+        std::string strVDGrayPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_GRAY_NAME + std::string(".png");
         cv::imwrite(strVDGrayPath, VD_Gray);
+        // 仅用于显示：让稀疏深度稍微“长粗”一点，更容易看
+        cv::Mat VD_Gray_Vis = VD_Gray.clone();
+        cv::Mat validMaskVis = validMask.clone();
+        cv::Mat visKernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+        cv::dilate(VD_Gray_Vis, VD_Gray_Vis, visKernel, cv::Point(-1, -1), 1);
+        cv::dilate(validMaskVis, validMaskVis, visKernel, cv::Point(-1, -1), 1);
 
         cv::Mat VD_Color;
-        cv::applyColorMap(VD_Gray, VD_Color, cv::COLORMAP_JET);
+        cv::applyColorMap(VD_Gray_Vis, VD_Color, cv::COLORMAP_TURBO);
 
-        // 轻量增强亮度与饱和度
+        // 增强颜色：重点提饱和度，亮度只轻微加一点
         cv::Mat hsv;
         cv::cvtColor(VD_Color, hsv, cv::COLOR_BGR2HSV);
         std::vector<cv::Mat> hsvChannels;
@@ -1825,7 +1824,7 @@ namespace LFMVS
 
         for (int row = 0; row < image_height; ++row)
         {
-            const uchar* maskPtr = validMask.ptr<uchar>(row);
+            const uchar* maskPtr = validMaskVis.ptr<uchar>(row);
             uchar* sPtr = hsvChannels[1].ptr<uchar>(row);
             uchar* vPtr = hsvChannels[2].ptr<uchar>(row);
 
@@ -1834,8 +1833,8 @@ namespace LFMVS
                 if (!maskPtr[col])
                     continue;
 
-                int s = static_cast<int>(sPtr[col] * 1.10f);
-                int v = static_cast<int>(vPtr[col] * 1.25f + 12.0f);
+                int s = static_cast<int>(sPtr[col] * 1.45f);
+                int v = static_cast<int>(vPtr[col] * 1.08f + 5.0f);
 
                 sPtr[col] = static_cast<uchar>(std::min(255, s));
                 vPtr[col] = static_cast<uchar>(std::min(255, v));
@@ -1845,16 +1844,12 @@ namespace LFMVS
         cv::merge(hsvChannels, hsv);
         cv::cvtColor(hsv, VD_Color, cv::COLOR_HSV2BGR);
 
-        // 无效区改成浅灰底，而不是黑底
-        cv::Mat VD_Color_Output(image_height, image_width, CV_8UC3, cv::Scalar(238, 238, 238));
-        VD_Color.copyTo(VD_Color_Output, validMask);
+        // 背景改成中性深灰，而不是浅灰白
+        cv::Mat VD_Color_Output(image_height, image_width, CV_8UC3, cv::Scalar(60, 60, 60));
+        VD_Color.copyTo(VD_Color_Output, validMaskVis);
 
-        // 轻微平滑，只影响显示观感
-        cv::Mat VD_Color_Blur;
-        cv::GaussianBlur(VD_Color_Output, VD_Color_Blur, cv::Size(0, 0), 0.6);
-        cv::addWeighted(VD_Color_Output, 0.88, VD_Color_Blur, 0.12, 0.0, VD_Color_Output);
-
-        std::string strVDColorPath = m_strSavePath + std::string("/VD_Raw_color.png");
+        // 不再对整张图做 GaussianBlur，否则又会被洗淡
+        std::string strVDColorPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_COLOR_NAME+ std::string(".png");
         cv::imwrite(strVDColorPath, VD_Color_Output);
 
         LOG_ERROR("LF-Refocus-backproject vis range: lo=", lo_vis,
