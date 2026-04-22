@@ -1494,7 +1494,7 @@ namespace LFMVS {
             QuadTreeProblemMap &problem_map = itr->second;
 
             // 构造写出路径
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -1584,7 +1584,7 @@ namespace LFMVS {
             QuadTreeProblemMap &problem_map = itr->second;
 
             // 构造写出路径
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -1656,7 +1656,7 @@ namespace LFMVS {
             QuadTreeProblemMap &problem_map = itr->second;
 
             // 构造写出路径
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -1731,7 +1731,7 @@ namespace LFMVS {
             QuadTreeProblemMap &problem_map = itr->second;
 
             // 构造写出路径
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -1791,7 +1791,7 @@ namespace LFMVS {
             return;
 
         // 构造写出路径
-        std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+        std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
         {
             boost::filesystem::path dir_save_path(strSavePath);
             if (!boost::filesystem::exists(dir_save_path)) {
@@ -2760,62 +2760,63 @@ namespace LFMVS {
         QuadTreeProblemMap &problems_map = itrFrame->second;
 
         // Step 1: 量化微图像的模糊程度和纹理丰富度
-        {
-            PrintMemoryInfo("Image_QE Begin");
-            bool bWrite  = true;
-            ImageQualityEstimate image_QE(this);
-            image_QE.SetBlurEstimateType(BST_Laplacian);
-            image_QE.QuantizeBlurLevelForMIC(itrFrame, true, bWrite);
-            image_QE.SetRichnessEstimateType(RST_GLCM);
-            image_QE.QuantizeRichnessLevelForMIC(itrFrame, true, bWrite);
-            // 计算每个微图像的指标值
-            SliceAndIndicatlizeForMI(itrFrame);
-            PrintMemoryInfo("Image_QE Finish");
-        }
-
-        // Step 2: 邻域微图像集合的选择
-        {
-            PrintMemoryInfo("SelectNeighbors Begin");
-            // (本质是选择出重叠度较高，可匹配性较好的微图像：photo、基线，二者结合计算出一个score, 存下来作为step3的引导)
-            SelectNeighbors selectNeighborsImp(this);
-            selectNeighborsImp.CollectMIANeighImagesForMatch(itrFrame);
-            //SelectNeighborsForProblems();
-            PrintMemoryInfo("SelectNeighbors Finish");
-        }
-
-        // Step 3: 视差匹配
-        {
-            PrintMemoryInfo("Stereo Begin");
-            MIStereoMatch miStereoImp(this);
-            //miStereoImp.StereoMatchingForMIA(itrFrame);
-            //miStereoImp.StereoMatchingForMIA_SoftProxyRepair(itrFrame);
-            // miStereoImp.StereoMatchingForMIA_FrameCrossViews(itrFrame);
-            miStereoImp.StereoMatchingForMIA_FrameCrossViews_ACMM(itrFrame);
-            //miStereoImp.StereoMatchingForMIA_SoftProxyPGRRepair(itrFrame);
-            WriteDisMapForMIA(strFrameName, problems_map);
-            PrintMemoryInfo("Stereo Finish");
-        }
-
-        // Step 4: 焦点堆栈的计算
-        {
-            PrintMemoryInfo("Refocus Begin");
-            LFRefocus refocusImp(this);
-//            refocusImp.FuseVirtualDepth_BackProject_OctreeVoxel(itrFrame);
-            refocusImp.FuseVirtualDepth_BackProject(itrFrame);
-            Focus_AIF_VD(itrFrame);
-            refocusImp.AIFImageCompositeForMIA(itrFrame);
-            PrintMemoryInfo("Refocus Finish");
-        }
+        // {
+        //     PrintMemoryInfo("Image_QE Begin");
+        //     bool bWrite  = true;
+        //     ImageQualityEstimate image_QE(this);
+        //     image_QE.SetBlurEstimateType(BST_Laplacian);
+        //     image_QE.QuantizeBlurLevelForMIC(itrFrame, true, bWrite);
+        //     image_QE.SetRichnessEstimateType(RST_GLCM);
+        //     image_QE.QuantizeRichnessLevelForMIC(itrFrame, true, bWrite);
+        //     // 计算每个微图像的指标值
+        //     SliceAndIndicatlizeForMI(itrFrame);
+        //     PrintMemoryInfo("Image_QE Finish");
+        // }
+        //
+        // // Step 2: 邻域微图像集合的选择
+        // {
+        //     PrintMemoryInfo("SelectNeighbors Begin");
+        //     // (本质是选择出重叠度较高，可匹配性较好的微图像：photo、基线，二者结合计算出一个score, 存下来作为step3的引导)
+        //     SelectNeighbors selectNeighborsImp(this);
+        //     selectNeighborsImp.CollectMIANeighImagesForMatch(itrFrame);
+        //     //SelectNeighborsForProblems();
+        //     PrintMemoryInfo("SelectNeighbors Finish");
+        // }
+        //
+        // // Step 3: 视差匹配
+        // {
+        //     PrintMemoryInfo("Stereo Begin");
+        //     MIStereoMatch miStereoImp(this);
+        //     //miStereoImp.StereoMatchingForMIA(itrFrame);
+        //     //miStereoImp.StereoMatchingForMIA_SoftProxyRepair(itrFrame);
+        //     // miStereoImp.StereoMatchingForMIA_FrameCrossViews(itrFrame);
+        //     miStereoImp.StereoMatchingForMIA_FrameCrossViews_ACMM(itrFrame);
+        //     Focus_AIF_VD(itrFrame); // 为了得到一个完整的全聚焦图像
+        //     miStereoImp.FilterAndStatic(itrFrame);
+        //     WriteDisMapForMIA(strFrameName, problems_map);
+        //     PrintMemoryInfo("Stereo Finish");
+        // }
+        //
+        // // Step 4: 焦点堆栈的计算
+        // {
+        //     PrintMemoryInfo("Refocus Begin");
+        //     LFRefocus refocusImp(this);
+        //     // refocusImp.FuseVirtualDepth_BackProject_OctreeVoxel(itrFrame);
+        //     refocusImp.FuseVirtualDepth_BackProject(itrFrame);
+        //     //Focus_AIF_VD(itrFrame);
+        //     //refocusImp.AIFImageCompositeForMIA(itrFrame);
+        //     PrintMemoryInfo("Refocus Finish");
+        // }
 
         // Step 5: 虚拟深度图转真实深度图
         // TODO: 1.统计功能用到这里，来去噪声
         // 2.实现定量验证
-         // {
-         //     VirtualToRealDepthFunc VTRDFunction(this);
-         //     VTRDFunction.SetVirtualToRealDepthType(VTORD_SegmentBehavioralmodel);
-         //     VTRDFunction.SetSamplePointSelectType(SPSelectByRandom);
-         //     VTRDFunction.VirtualToRealDepth(itrFrame);
-         // }
+         {
+             VirtualToRealDepthFunc VTRDFunction(this);
+             VTRDFunction.SetVirtualToRealDepthType(VTORD_SegmentBehavioralmodel_Manual);
+             VTRDFunction.SetSamplePointSelectType(SPSelectByRandom);
+             VTRDFunction.VirtualToRealDepth(itrFrame);
+         }
     }
 
         void DepthSolver::ProcessProblemsImp(bool geom_consistency)
@@ -4857,7 +4858,7 @@ namespace LFMVS {
                         std::cout << "dir failed to create: " << strMLAResultFolder << std::endl;
                     }
                 }
-                strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+                strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strMLAResultFolder);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -4936,7 +4937,7 @@ namespace LFMVS {
             //
             //         // 创建路径
             //         std::string strMLAResultFolder  = m_strRootPath + LF_DEPTH_INTRA_NAME + strFrameName;
-            //         std::string strMLADisFolder = strMLAResultFolder + LF_MVS_RESULT_DATA_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
+            //         std::string strMLADisFolder = strMLAResultFolder + MVS_RESULT_DATA_FOLDER_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
             //         boost::filesystem::path dir_save_path(strMLADisFolder);
             //         if (!boost::filesystem::exists(dir_save_path))
             //         {
@@ -5149,7 +5150,7 @@ namespace LFMVS {
                         std::cout << "dir failed to create: " << strMLAResultFolder << std::endl;
                     }
                 }
-                strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+                strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strMLAResultFolder);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -5225,7 +5226,7 @@ namespace LFMVS {
                     // 创建路径
                     std::string strMLAResultFolder = m_strRootPath + LF_DEPTH_INTRA_NAME + strName;
                     std::string strMLADisFolder =
-                            strMLAResultFolder + LF_MVS_RESULT_DATA_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
+                            strMLAResultFolder + MVS_RESULT_DATA_FOLDER_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
                     boost::filesystem::path dir_save_path(strMLADisFolder);
                     if (!boost::filesystem::exists(dir_save_path)) {
                         if (!boost::filesystem::create_directory(dir_save_path)) {
@@ -5341,7 +5342,7 @@ namespace LFMVS {
                             std::cout << "dir failed to create: " << strMLAResultFolder << std::endl;
                         }
                     }
-                    strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+                    strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
                     {
                         boost::filesystem::path dir_save_path(strMLAResultFolder);
                         if (!boost::filesystem::exists(dir_save_path)) {
@@ -5476,7 +5477,7 @@ namespace LFMVS {
                         std::cout << "dir failed to create: " << strMLAResultFolder << std::endl;
                     }
                 }
-                strMLAResultFolder += LF_MVS_RESULT_DATA_NAME;
+                strMLAResultFolder += MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strMLAResultFolder);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -5732,7 +5733,7 @@ namespace LFMVS {
                     // 创建路径
                     std::string strMLAResultFolder = m_strRootPath + LF_DEPTH_INTRA_NAME + strName;
                     std::string strMLADisFolder =
-                            strMLAResultFolder + LF_MVS_RESULT_DATA_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
+                            strMLAResultFolder + MVS_RESULT_DATA_FOLDER_NAME + LF_MLA_DISPARITYMAPS_PLANNER_NAME;
                     boost::filesystem::path dir_save_path(strMLADisFolder);
                     if (!boost::filesystem::exists(dir_save_path)) {
                         if (!boost::filesystem::create_directory(dir_save_path)) {
@@ -6039,7 +6040,7 @@ namespace LFMVS {
                     }
                 }
 
-                std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+                std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strSavePath);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -6145,7 +6146,7 @@ namespace LFMVS {
 
                 // 写出
                 if (m_strSavePath.empty())
-                    m_strSavePath = m_strRootPath + LF_DEPTH_INTRA_NAME + LF_MVS_RESULT_DATA_NAME + strName;
+                    m_strSavePath = m_strRootPath + LF_DEPTH_INTRA_NAME + MVS_RESULT_DATA_FOLDER_NAME + strName;
                 cv::Mat disp_color;
                 applyColorMap(disp_gray, disp_color, cv::COLORMAP_JET);
                 if (m_bPlannar == true && m_bLRCheck == false) {
@@ -6272,7 +6273,7 @@ namespace LFMVS {
                 }
 
                 // 写出
-                std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+                std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strSavePath);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -6587,7 +6588,7 @@ namespace LFMVS {
             }
 
             // 写出
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -6833,7 +6834,7 @@ namespace LFMVS {
             }
 
             // 写出
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -7478,7 +7479,7 @@ namespace LFMVS {
                 }
             }
 
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
@@ -7769,7 +7770,7 @@ namespace LFMVS {
                     }
                 }
 
-                std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+                std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
                 {
                     boost::filesystem::path dir_save_path(strSavePath);
                     if (!boost::filesystem::exists(dir_save_path)) {
@@ -8052,7 +8053,7 @@ namespace LFMVS {
                 }
             }
 
-            std::string strSavePath = m_strSavePath + strName + LF_MVS_RESULT_DATA_NAME;
+            std::string strSavePath = m_strSavePath + strName + MVS_RESULT_DATA_FOLDER_NAME;
             {
                 boost::filesystem::path dir_save_path(strSavePath);
                 if (!boost::filesystem::exists(dir_save_path)) {
