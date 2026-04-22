@@ -12,7 +12,8 @@ namespace LFMVS
     {
         VTORD_Behavioralmodel,
         VTORD_SegmentBehavioralmodel,
-        VTORD_SegmentBehavioralmodel_2
+        VTORD_SegmentBehavioralmodel_2,
+        VTORD_SegmentBehavioralmodel_Manual
     };
 
     enum SamplePointSelectType
@@ -25,8 +26,6 @@ namespace LFMVS
     class VirtualToRealDepthFunc
     {
         friend DepthSolver;
-
-
     public:
         VirtualToRealDepthFunc(DepthSolver* pDepthSolver);
         ~VirtualToRealDepthFunc();
@@ -43,6 +42,7 @@ namespace LFMVS
         cv::Mat ConvertVdImageToRd(cv::Mat virtualDepthImage);
 
         void SamplePointSelect();
+        std::array<double,3> BehavioralModel(std::vector<float>& refDepthValue, std::vector<float>& virtualDepthValue);
 
     public:
         struct Sample
@@ -83,6 +83,7 @@ namespace LFMVS
         void VirtualToRealDepthBySegBM();
         void VirtualToRealDepthBySegBM_2();
         void VirtualToRealDepthBySegBM_new();
+        void VirtualToRealDepthByManual(std::string& strFrameName);
 
         enum class DistanceType { Chamfer, Euclidean, Mean, Median};
 
@@ -94,8 +95,6 @@ namespace LFMVS
                 std::vector<float>& refDepthValue,
                 std::vector<float>& virtualDepthValue,
                 cv::Rect& roi);
-
-        std::array<double,3> BehavioralModel(std::vector<float>& refDepthValue, std::vector<float>& virtualDepthValue);
 
         cv::Mat convertVirtualToRealDepth( std::array<double, 3>& behaviorModelParams);
 
@@ -136,6 +135,9 @@ namespace LFMVS
         void selectVdPoints();
 
         void fitSegmentsParams(std::string xml_path);
+        void fitSegmentsParams_new(std::string xml_path);
+
+        void ValidateBehaviorModelByBox();
 
     public:
         struct SampleErrorStatsOptions
@@ -147,9 +149,11 @@ namespace LFMVS
                     int sampleCount = 5;   // 误差计算：每个坐标点采样数量
                 };
 
+    public:
+        std::string                 m_strRootPath;
+
     private:
         DepthSolver*                m_ptrDepthSolver;
-        std::string                 m_strRootPath;
 
         VTORDType                   m_VirtualToRealDepthType;
         SamplePointSelectType       m_SamplePointSelectType;
@@ -158,8 +162,11 @@ namespace LFMVS
 
         cv::Mat                     m_virtualDepthImage;
         cv::Mat                     m_refDepthImage;
+        cv::Mat                     m_realDepthImage;
+
         int                         m_rdImage_rows;
         int                         m_rdImage_cols;
+
         std::vector<cv::Point>      m_samplePoints;
         std::vector<cv::Point>      m_coordsVirtual;
         std::vector<cv::Point>      m_coordsRef;
@@ -174,7 +181,114 @@ namespace LFMVS
 
 }
 
+namespace
+{
+    struct ManualPairRecord
+    {
+        int selectionIndex = -1;
+        cv::Point pt;          // 鼠标点击中心点
+        float vdMean = 0.0f;   // 圆内 VD 均值
+        float refMean = 0.0f;  // 圆内 REF 均值
+        double vdRmse = 0.0;
+        double refRmse = 0.0;
+    };
+
+    struct ManualSelectionRecord
+    {
+        cv::Point center;
+        std::string sourceWindow;
+        std::vector<cv::Point> circlePoints;
+        std::vector<float> vdValues;
+        std::vector<float> refValues;
+
+        std::vector<std::string> vdPointLines;   // 左列显示
+        std::vector<std::string> refPointLines;  // 右列显示
+
+        double vdRmse = 0.0;
+        double refRmse = 0.0;
+        size_t pairBegin = 0;
+        size_t pairEnd = 0;
+    };
+
+    struct ManualUIState
+    {
+        cv::Mat refDepth32F;
+        cv::Mat virtualDepth32F;
+
+        cv::Mat refFocusBase;
+        cv::Mat virtualColorBase;
+
+        cv::Mat refFocusShow;
+        cv::Mat virtualColorShow;
+        cv::Mat infoPanel;
+
+        std::string outputTxtPath;
+        std::string outputScatterPath;
+        std::string outputFocusMarkedPath;
+        std::string outputVirtualMarkedPath;
+
+        int circleRadius =50;
+
+        std::vector<ManualSelectionRecord> selections;
+        std::vector<ManualPairRecord> pairRecords;
+
+        cv::Point hoverPoint = cv::Point(-1, -1);
+        double hoverRefMean = 0.0;
+        bool hoverValid = false;
+
+        int infoScrollOffset = 0;
+
+        std::chrono::steady_clock::time_point lastHoverUpdateTime = std::chrono::steady_clock::now();
+        bool hoverTimeInitialized = false;
+    };
+
+    struct BehaviorModelSegment
+    {
+        double depthMin = 0.0;
+        double depthMax = 0.0;
+        std::array<double, 3> params = {0.0, 0.0, 0.0};
+    };
+
+    struct ValidationBoxRecord
+    {
+        std::vector<cv::Point> corners;   // 4个点
+        cv::Rect bbox;                    // 包围盒
+
+        float vdMean = 0.0f;
+        float rdEst = 0.0f;
+
+        bool hasRefMean = false;
+        float refMean = 0.0f;
+        float absErr = 0.0f;
+
+        int vdValidCount = 0;
+        int refValidCount = 0;
+    };
+
+    struct ValidationUIState
+    {
+        cv::Mat focusBase;
+        cv::Mat focusShow;
+
+        cv::Mat vd32F;
+        cv::Mat ref32F;
+
+        std::vector<BehaviorModelSegment> segments;
+
+        std::vector<cv::Point> currentPoints;          // 当前正在点的4个点
+        std::vector<ValidationBoxRecord> records;      // 历史验证框
+
+        std::string outputImagePath;
+        std::string outputTxtPath;
+    };
+
+    ValidationUIState& GetValidationUIState()
+    {
+        static ValidationUIState state;
+        return state;
+    }
 
 
+}
 
 #endif //ACMP_VIRTUALTOREALDEPTHFUNC_H
