@@ -6614,71 +6614,57 @@ void ZoomManualImageView(ManualImageViewState& viewState,
     }
 
 void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
+{
+    (void)userdata;
+    ManualUIState& state = GetManualUIState();
+
+    if (event == cv::EVENT_MOUSEWHEEL)
     {
-        (void)userdata;
-        ManualUIState& state = GetManualUIState();
-
-        if (event == cv::EVENT_MOUSEWHEEL)
+        int delta = cv::getMouseWheelDelta(flags);
+        if (delta != 0)
         {
-            int delta = cv::getMouseWheelDelta(flags);
-            if (delta != 0)
-            {
-                ZoomManualImageView(state.focusViewState,
-                                    state.refDepth32F.size(),
-                                    cv::Point(x, y),
-                                    delta);
-                RefreshManualWindows();
-            }
-            return;
-        }
-
-        if (event == cv::EVENT_MBUTTONDOWN)
-        {
-            state.focusViewState.middleDragging = true;
-            state.focusViewState.lastMouse = cv::Point(x, y);
-            return;
-        }
-
-        if (event == cv::EVENT_MBUTTONUP)
-        {
-            state.focusViewState.middleDragging = false;
-            state.focusViewState.lastMouse = cv::Point(-1, -1);
-            return;
-        }
-
-        if (event == cv::EVENT_MOUSEMOVE && state.focusViewState.middleDragging)
-        {
-            PanManualImageView(state.focusViewState, state.refDepth32F.size(), cv::Point(x, y));
+            ZoomManualImageView(state.focusViewState,
+                                state.refDepth32F.size(),
+                                cv::Point(x, y),
+                                delta);
             RefreshManualWindows();
-            return;
         }
+        return;
+    }
 
-        if (event == cv::EVENT_MOUSEMOVE)
+    if (event == cv::EVENT_MBUTTONDOWN)
+    {
+        state.focusViewState.middleDragging = true;
+        state.focusViewState.lastMouse = cv::Point(x, y);
+        return;
+    }
+
+    if (event == cv::EVENT_MBUTTONUP)
+    {
+        state.focusViewState.middleDragging = false;
+        state.focusViewState.lastMouse = cv::Point(-1, -1);
+        return;
+    }
+
+    // 只在中键拖动时响应鼠标移动
+    if (event == cv::EVENT_MOUSEMOVE && state.focusViewState.middleDragging)
+    {
+        PanManualImageView(state.focusViewState, state.refDepth32F.size(), cv::Point(x, y));
+        RefreshManualWindows();
+        return;
+    }
+
+    // 普通鼠标移动不再做任何 hover 计算，避免持续响应导致卡顿
+
+    if (event == cv::EVENT_LBUTTONDOWN)
+    {
+        cv::Point imgPt;
+        if (MapDisplayPointToManualImage(cv::Point(x, y),
+                                         state.refDepth32F.size(),
+                                         state.focusViewState,
+                                         imgPt))
         {
-            cv::Point imgPt;
-            if (!MapDisplayPointToManualImage(cv::Point(x, y),
-                                              state.refDepth32F.size(),
-                                              state.focusViewState,
-                                              imgPt))
-            {
-                return;
-            }
-
-            auto now = std::chrono::steady_clock::now();
-
-            if (!state.hoverTimeInitialized)
-            {
-                state.lastHoverUpdateTime = now;
-                state.hoverTimeInitialized = true;
-            }
-
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - state.lastHoverUpdateTime).count();
-
-            if (elapsedMs < 3000)
-                return;
-
-            state.lastHoverUpdateTime = now;
+            // 原来在鼠标移动时做的 hover 计算，改到左键点击时做
             state.hoverPoint = imgPt;
 
             std::vector<cv::Point> hoverCircle =
@@ -6687,26 +6673,17 @@ void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
             state.hoverRefMean = ComputeHoverRefMean(state.refDepth32F, hoverCircle);
             state.hoverValid = true;
 
-            RefreshManualWindows();
-            return;
+            // 保留原来的采样点选择逻辑
+            HandleManualClick(imgPt.x, imgPt.y, "Focus");
         }
-
-        if (event == cv::EVENT_LBUTTONDOWN)
-        {
-            cv::Point imgPt;
-            if (MapDisplayPointToManualImage(cv::Point(x, y),
-                                             state.refDepth32F.size(),
-                                             state.focusViewState,
-                                             imgPt))
-            {
-                HandleManualClick(imgPt.x, imgPt.y, "Focus");
-            }
-        }
-        else if (event == cv::EVENT_RBUTTONDOWN)
-        {
-            UndoLastManualSelection();
-        }
+        return;
     }
+    else if (event == cv::EVENT_RBUTTONDOWN)
+    {
+        UndoLastManualSelection();
+        return;
+    }
+}
 
     void OnMouseVirtual(int event, int x, int y, int flags, void* userdata)
     {
