@@ -7,6 +7,8 @@
 #include <iostream>
 #include <omp.h>
 #include <cmath>
+
+#include "Common/Common.h"
 #include "VirtualToRealDepthFunc.h"
 #include "Util/Logger.h"
 #include "LFRefocus.h"
@@ -40,7 +42,7 @@ namespace LFMVS {
         return m_SamplePointSelectType;
     }
 
-    void VirtualToRealDepthFunc::VirtualToRealDepth(QuadTreeProblemMapMap::iterator &itrP)
+    void VirtualToRealDepthFunc::VirtualToRealDepth(QuadTreeProblemMapMap::iterator& itrP)
     {
         switch (m_VirtualToRealDepthType)
         {
@@ -58,6 +60,12 @@ namespace LFMVS {
             {
                 //VirtualToRealDepthBySegBM_2();
                 VirtualToRealDepthBySegBM_new();
+            }
+                break;
+            case VTORD_SegmentBehavioralmodel_Manual:    // 手动
+            {
+                std::string strFrameName = itrP->first;
+                VirtualToRealDepthByManual(strFrameName);
             }
                 break;
             default:
@@ -152,6 +160,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
         int supportCount;
 
         float aifGrad;
+        float vdEdgeResp;
         float grayMean;
         float grayStd;
         float cornerResp;
@@ -310,6 +319,51 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     }
 
     // ------------------------------------------------------------
+    // VD 局部突变图：很多“深度边缘”在 AIF 梯度上不够强，但在 VD 上会跳变
+    // ------------------------------------------------------------
+    cv::Mat vdEdgeResp = cv::Mat::zeros(m_virtualDepthImage.size(), CV_32FC1);
+    for (int y = 1; y < m_virtualDepthImage.rows - 1; ++y)
+    {
+        for (int x = 1; x < m_virtualDepthImage.cols - 1; ++x)
+        {
+            float v = m_virtualDepthImage.at<float>(y, x);
+            if (!isValidValue(v))
+                continue;
+
+            float maxDiff = 0.0f;
+            int validNbr = 0;
+
+            static const int dx4[4] = {1, -1, 0, 0};
+            static const int dy4[4] = {0, 0, 1, -1};
+
+            for (int k = 0; k < 4; ++k)
+            {
+                int xx = x + dx4[k];
+                int yy = y + dy4[k];
+                float nv = m_virtualDepthImage.at<float>(yy, xx);
+                if (!isValidValue(nv))
+                    continue;
+
+                maxDiff = std::max(maxDiff, std::fabs(nv - v));
+                validNbr++;
+            }
+
+            if (validNbr >= 2)
+                vdEdgeResp.at<float>(y, x) = maxDiff;
+        }
+    }
+
+    // 归一化到 0~255，便于与 guideGrad 融合
+    {
+        double vmax = 0.0;
+        cv::minMaxLoc(vdEdgeResp, nullptr, &vmax);
+        if (vmax > 1e-8)
+            vdEdgeResp.convertTo(vdEdgeResp, CV_32F, 255.0 / vmax);
+        else
+            vdEdgeResp = cv::Mat::zeros(vdEdgeResp.size(), CV_32F);
+    }
+
+    // ------------------------------------------------------------
     // 预提取所有有效 GT 点
     // ------------------------------------------------------------
     std::vector<GTPoint> gtPoints;
@@ -339,7 +393,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     }
 
     // ------------------------------------------------------------
-    // GT 距离图：任意像素到最近 GT 有效点的距离
+    // GT 距离图
     // ------------------------------------------------------------
     cv::Mat gtValidMask = cv::Mat::zeros(m_refDepthImage.size(), CV_8UC1);
     for (size_t i = 0; i < gtPoints.size(); ++i)
@@ -353,17 +407,21 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     gtDistMap.convertTo(gtDistMap, CV_32F);
 
     // ------------------------------------------------------------
-    // 强边缘距离图：seed 不能太靠边
+    // 联合边缘图：AIF 边缘 + VD 边缘
     // ------------------------------------------------------------
-    const float seedEdgeGradThresh = 55.0f;
+    const float aifEdgeThresh = 48.0f;
+    const float vdEdgeThresh  = 22.0f;   // 归一化后的阈值，先保守一些
+
     cv::Mat strongEdgeMask = cv::Mat::zeros(guideGrad.size(), CV_8UC1);
     for (int y = 0; y < guideGrad.rows; ++y)
     {
         const float* gptr = guideGrad.ptr<float>(y);
+        const float* vptr = vdEdgeResp.ptr<float>(y);
         uchar* mptr = strongEdgeMask.ptr<uchar>(y);
+
         for (int x = 0; x < guideGrad.cols; ++x)
         {
-            if (gptr[x] > seedEdgeGradThresh)
+            if (gptr[x] > aifEdgeThresh || vptr[x] > vdEdgeThresh)
                 mptr[x] = 255;
         }
     }
@@ -399,16 +457,16 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     const float candidateMinCornerResp  = 1.5f;
     const float candidateMaxGtDist      = 24.0f;
 
-    // 新增：seed 不能紧贴强边缘
-    const float candidateMinEdgeDist    = 5.0f;
+    // 比上一版再收紧一些：seed 远离边
+    const float candidateMinEdgeDist    = 7.0f;
 
     const int   gridCols                = 6;
     const int   gridRows                = 6;
     const int   seedsPerBin             = 24;
     const int   vdBinCount              = 8;
 
-    const int   supportSearchRadius     = 12;
-    const int   supportMaxPoints        = 12;
+    const int   supportSearchRadius     = 8;
+    const int   supportMaxPoints        = 10;   // 更紧凑
     const int   supportMinPoints        = 4;
     const float supportBandAbsMin       = 0.04f;
     const float supportBandMadScale     = 3.5f;
@@ -420,13 +478,16 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     const float supportMinGrayStd       = 4.0f;
     const float supportMinCornerResp    = 1.5f;
 
-    // 新增：support 不应太“边缘化”
-    const float supportMaxEdgeRatio     = 0.35f;
-    const float supportNearEdgeDist     = 2.5f;
-    const float supportMaxNearEdgeRatio = 0.50f;
+    const float supportMaxEdgeRatio     = 0.28f;
+    const float supportNearEdgeDist     = 3.5f;
+    const float supportMaxNearEdgeRatio = 0.30f;
 
-    // 新增：support 不应太“线状”
-    const float minSupportShapeRatio    = 0.12f;
+    // 线状 support 判定再严格些
+    const float minSupportShapeRatio    = 0.18f;
+    const float minSupportFillRatio     = 0.08f;
+
+    // seed 与 support 质心偏太远，也说明 support 更像“沿边挂着”
+    const float maxSupportCentroidDrift = 4.5f;
 
     const std::vector<int> gtSearchRadii = {8, 16, 28, 40, 56};
     const int   minGtCount              = 2;
@@ -437,8 +498,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     const float minGtPeakGap            = 0.04f;
     const int   softMaxGtSearchRadius   = 40;
 
-    // 新增：GT support 质心不能偏离 VD support 太多
-    const float maxGTCentroidOffset     = 10.0f;
+    const float maxGTCentroidOffset     = 7.0f;
 
     const int   minRepresentativePairsForFit = 6;
 
@@ -490,6 +550,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             float corner = cornerResp.at<float>(y, x);
             float gtDist = gtDistMap.at<float>(y, x);
             float edgeDist = edgeDistMap.at<float>(y, x);
+            float vdEdge = vdEdgeResp.at<float>(y, x);
 
             if (gtDist > candidateMaxGtDist)
                 continue;
@@ -515,11 +576,9 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             if (corner < 6.0f)   texturePenalty += (6.0f - corner) * 0.04f;
             if (grayMean < 30.0f) texturePenalty += (30.0f - grayMean) * 0.01f;
 
-            // GT 越近越优先
             texturePenalty += gtDist * 0.06f;
-
-            // 离边越近，分数越差
-            texturePenalty += 2.0f / (edgeDist + 1.0f);
+            texturePenalty += 2.5f / (edgeDist + 1.0f);
+            texturePenalty += vdEdge * 0.01f;
 
             VDCandidate c;
             c.x = x;
@@ -530,6 +589,7 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             c.vdSpan = span;
             c.supportCount = count;
             c.aifGrad = grad;
+            c.vdEdgeResp = vdEdge;
             c.grayMean = grayMean;
             c.grayStd = grayStd;
             c.cornerResp = corner;
@@ -688,10 +748,11 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             y = std::max(0, std::min(guideGrad.rows - 1, y));
 
             float g = guideGrad.at<float>(y, x);
+            float vg = vdEdgeResp.at<float>(y, x);
             float curGray = static_cast<float>(guideGray.at<uchar>(y, x));
             float dGray = std::fabs(curGray - prevGray);
 
-            if (g > strongEdgeThresh && dGray > maxGrayJump)
+            if ((g > strongEdgeThresh && dGray > maxGrayJump) || vg > 24.0f)
                 return true;
 
             prevGray = curGray;
@@ -921,9 +982,10 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
     int rejectWeakTexture = 0;
     int rejectSupportEdge = 0;
     int rejectAmbiguousGT = 0;
-
     int rejectSupportLineLike = 0;
     int rejectGTCentroidOffset = 0;
+    int rejectSupportCentroidDrift = 0;
+    int rejectSupportLowFill = 0;
 
     // ------------------------------------------------------------
     // Step 3: seed -> support -> GT support -> representative pair
@@ -1009,8 +1071,12 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             supportGrayVals.push_back(g);
 
             sumCorner += cornerResp.at<float>(neighbors[k].y, neighbors[k].x);
-            if (guideGrad.at<float>(neighbors[k].y, neighbors[k].x) > strongEdgeThresh)
+
+            if (guideGrad.at<float>(neighbors[k].y, neighbors[k].x) > strongEdgeThresh ||
+                vdEdgeResp.at<float>(neighbors[k].y, neighbors[k].x) > 24.0f)
+            {
                 edgeCount++;
+            }
 
             if (edgeDistMap.at<float>(neighbors[k].y, neighbors[k].x) < supportNearEdgeDist)
                 nearEdgeCount++;
@@ -1055,18 +1121,40 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             continue;
         }
 
-        // --------------------------------------------------------
-        // support 形状约束：不要“沿边一串”的线状 support
-        // --------------------------------------------------------
         float meanX = 0.0f, meanY = 0.0f;
+        int minSX = std::numeric_limits<int>::max();
+        int minSY = std::numeric_limits<int>::max();
+        int maxSX = 0;
+        int maxSY = 0;
         for (size_t k = 0; k < supportPts.size(); ++k)
         {
             meanX += static_cast<float>(supportPts[k].x);
             meanY += static_cast<float>(supportPts[k].y);
+            minSX = std::min(minSX, supportPts[k].x);
+            minSY = std::min(minSY, supportPts[k].y);
+            maxSX = std::max(maxSX, supportPts[k].x);
+            maxSY = std::max(maxSY, supportPts[k].y);
         }
         meanX /= static_cast<float>(supportPts.size());
         meanY /= static_cast<float>(supportPts.size());
 
+        float supportCentroidDrift = std::sqrt((meanX - seed.x) * (meanX - seed.x) +
+                                               (meanY - seed.y) * (meanY - seed.y));
+        if (supportCentroidDrift > maxSupportCentroidDrift)
+        {
+            ++rejectSupportCentroidDrift;
+            continue;
+        }
+
+        // bbox 填充率：沿边一串的点常常 bbox 很大，但点数很少
+        float bboxArea = static_cast<float>((maxSX - minSX + 1) * (maxSY - minSY + 1));
+        float fillRatio = bboxArea > 0.0f ? static_cast<float>(supportPts.size()) / bboxArea : 1.0f;
+        if (fillRatio < minSupportFillRatio && bboxArea>=25.0f)
+        {
+            ++rejectSupportLowFill;
+        }
+
+        // 协方差形状约束：线状 support 要剔除
         if (supportPts.size() >= 4)
         {
             double varXX = 0.0;
@@ -1110,9 +1198,6 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
             continue;
         }
 
-        // --------------------------------------------------------
-        // GT support 质心偏移约束：避免 GT 是“从附近别处搜来的”
-        // --------------------------------------------------------
         float gtMeanX = 0.0f, gtMeanY = 0.0f;
         for (size_t k = 0; k < gtRes.pts.size(); ++k)
         {
@@ -1172,6 +1257,10 @@ void VirtualToRealDepthFunc::VirtualToRealDepthBySegBM_new()
               << rejectSupportEdge << std::endl;
     std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportLineLike: "
               << rejectSupportLineLike << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportCentroidDrift: "
+              << rejectSupportCentroidDrift << std::endl;
+    std::cout << "[VirtualToRealDepthBySegBM_new] rejectSupportLowFill: "
+              << rejectSupportLowFill << std::endl;
     std::cout << "[VirtualToRealDepthBySegBM_new] rejectGTCentroidOffset: "
               << rejectGTCentroidOffset << std::endl;
     std::cout << "[VirtualToRealDepthBySegBM_new] rejectAmbiguousGT: "
@@ -2861,7 +2950,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         SamplePointSelect();
 
         // Step 4: 误差统计
-//        errorStatisticsImage(realDepthImage, m_refDepthImage, focusImage, distanceImage_path);
+//        errorStatisticsImage(m_realDepthImage, m_refDepthImage, focusImage, distanceImage_path);
         errorStatisticsImageSeg(realDepthImage, m_refDepthImage, m_virtualDepthImage,focusImage, distanceImage_path);
 
     }
@@ -3449,7 +3538,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                 continue;
 
             float valPred = realDepthImage.at<float>(y, x);
-            //   float valPred = getValidRefValue(realDepthImage, x, y, SESOptions.virtualSearchRadius);
+            //   float valPred = getValidRefValue(m_realDepthImage, x, y, SESOptions.virtualSearchRadius);
             float valRef = getValidRefValue(refDepthImage, x, y, SESOptions.virtualSearchRadius);
 
             if (!std::isfinite(valPred) || !std::isfinite(valRef))
@@ -3487,7 +3576,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                      if (rejectLocalOutliers && mask_outlier.at<uchar>(y, x))
                          continue;
 
-                     float valPred = realDepthImage.at<float>(y, x);
+                     float valPred = m_realDepthImage.at<float>(y, x);
                   //   float valRef = refDepthImage.at<float>(y, x);
                      float valRef = getValidRefValue(refDepthImage, x, y, virtualSearchRadius);
 
@@ -3635,7 +3724,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                 continue;
 
             float valPred = realDepthImage.at<float>(y, x);
-            //   float valPred = getValidRefValue(realDepthImage, x, y, SESOptions.virtualSearchRadius);
+            //   float valPred = getValidRefValue(m_realDepthImage, x, y, SESOptions.virtualSearchRadius);
             float valRef = getValidRefValue(refDepthImage, x, y, SESOptions.virtualSearchRadius);
 
             if (!std::isfinite(valPred) || !std::isfinite(valRef))
@@ -3680,7 +3769,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                      if (rejectLocalOutliers && mask_outlier.at<uchar>(y, x))
                          continue;
 
-                     float valPred = realDepthImage.at<float>(y, x);
+                     float valPred = m_realDepthImage.at<float>(y, x);
                   //   float valRef = refDepthImage.at<float>(y, x);
                      float valRef = getValidRefValue(refDepthImage, x, y, virtualSearchRadius);
 
@@ -4006,7 +4095,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         // ---------------------------
         // 11) 采样点统计
         //     分段按 VD
-        //     误差按 |GT(=realDepthImage) - REF|
+        //     误差按 |GT(=m_realDepthImage) - REF|
         // ---------------------------
         totalStats.diffs.reserve(m_samplePoints.size());
 
@@ -4227,7 +4316,7 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
                 continue;
             }
 
-            // 1) 取 realDepthImage 的值(若中心点无效，则逐圈扩展找到 targetNeighborCount_vd 个有效点求均值)
+            // 1) 取 m_realDepthImage 的值(若中心点无效，则逐圈扩展找到 targetNeighborCount_vd 个有效点求均值)
             float realValue = realDepthImage.at<float>(pt.y, pt.x);
             bool realValid = std::isfinite(realValue) && realValue > 0.0f;
 
@@ -5692,1209 +5781,1185 @@ void VirtualToRealDepthFunc::fitSegmentsParams_new(std::string xml_path)
         return found_nearest;
     }
 
-    // 挑选拟合多个行为模型参数的样本点
-    /*void VirtualToRealDepthFunc::sampleVirtualDepthPointsByRegion(
-            std::string& vdepth_path,
-            std::string& gt_path,
-            std::string& output_mark_path,
-            std::string& output_csv)
+
+    ManualUIState& GetManualUIState()
     {
-        std::vector<std::pair<float,float>> ranges =
+        static ManualUIState state;
+        return state;
+    }
+
+    cv::Mat ToSingleFloat(const cv::Mat& src)
+    {
+        cv::Mat out;
+        if (src.empty())
+            return out;
+
+        if (src.channels() > 1)
+            cv::extractChannel(src, out, 0);
+        else
+            out = src.clone();
+
+        if (out.type() != CV_32FC1)
+            out.convertTo(out, CV_32F);
+
+        return out;
+    }
+
+    float ReadDepthValue(const cv::Mat& img, int x, int y)
+    {
+        if (img.empty())
+            return 0.0f;
+        if (x < 0 || y < 0 || x >= img.cols || y >= img.rows)
+            return 0.0f;
+
+        float v = img.at<float>(y, x);
+        if (!std::isfinite(v) || v <= 0.0f)
+            return 0.0f;
+        return v;
+    }
+
+    std::vector<cv::Point> CollectCirclePoints(const cv::Point& center, int radius, const cv::Size& size)
+    {
+        std::vector<cv::Point> pts;
+        if (size.width <= 0 || size.height <= 0)
+            return pts;
+
+        int xMin = std::max(0, center.x - radius);
+        int xMax = std::min(size.width - 1, center.x + radius);
+        int yMin = std::max(0, center.y - radius);
+        int yMax = std::min(size.height - 1, center.y + radius);
+
+        pts.reserve((2 * radius + 1) * (2 * radius + 1));
+
+        for (int y = yMin; y <= yMax; ++y)
+        {
+            for (int x = xMin; x <= xMax; ++x)
+            {
+                int dx = x - center.x;
+                int dy = y - center.y;
+                if (dx * dx + dy * dy <= radius * radius)
+                    pts.emplace_back(x, y);
+            }
+        }
+        return pts;
+    }
+
+    double ComputeLocalRMSE(const cv::Mat& depthImage,
+                            const std::vector<cv::Point>& circlePoints,
+                            const cv::Point& center,
+                            std::vector<float>& validValues)
+    {
+        validValues.clear();
+
+        for (size_t i = 0; i < circlePoints.size(); ++i)
+        {
+            float v = ReadDepthValue(depthImage, circlePoints[i].x, circlePoints[i].y);
+            if (v > 0.0f)
+                validValues.push_back(v);
+        }
+
+        if (validValues.empty())
+            return 0.0;
+
+        float refValue = ReadDepthValue(depthImage, center.x, center.y);
+        if (refValue <= 0.0f)
+        {
+            double mean = 0.0;
+            for (size_t i = 0; i < validValues.size(); ++i)
+                mean += validValues[i];
+            refValue = static_cast<float>(mean / std::max<size_t>(1, validValues.size()));
+        }
+
+        double sumSq = 0.0;
+        for (size_t i = 0; i < validValues.size(); ++i)
+        {
+            double diff = static_cast<double>(validValues[i]) - static_cast<double>(refValue);
+            sumSq += diff * diff;
+        }
+
+        return std::sqrt(sumSq / std::max<size_t>(1, validValues.size()));
+    }
+
+    double ComputeMeanFromValidValues(const std::vector<float>& values)
+    {
+        if (values.empty())
+            return 0.0;
+
+        double sum = 0.0;
+        for (size_t i = 0; i < values.size(); ++i)
+            sum += values[i];
+
+        return sum / static_cast<double>(values.size());
+    }
+
+    double ComputeHoverRefMean(const cv::Mat& refDepth32F,
+                               const std::vector<cv::Point>& circlePoints)
+    {
+        double sum = 0.0;
+        int count = 0;
+
+        for (size_t i = 0; i < circlePoints.size(); ++i)
+        {
+            float ref = ReadDepthValue(refDepth32F, circlePoints[i].x, circlePoints[i].y);
+            if (ref > 0.0f)
+            {
+                sum += ref;
+                count++;
+            }
+        }
+
+        if (count == 0)
+            return 0.0;
+
+        return sum / static_cast<double>(count);
+    }
+
+    cv::Mat BuildRefFocusImage(const cv::Mat& focusImage,
+                               const cv::Mat& refDepth32F,
+                               float specialDepthMin,
+                               float specialDepthMax)
+    {
+        cv::Mat out;
+        if (focusImage.channels() == 1)
+            cv::cvtColor(focusImage, out, cv::COLOR_GRAY2BGR);
+        else
+            out = focusImage.clone();
+
+        for (int y = 0; y < refDepth32F.rows; ++y)
+        {
+            for (int x = 0; x < refDepth32F.cols; ++x)
+            {
+                float d = refDepth32F.at<float>(y, x);
+                if (d > 0.0f && std::isfinite(d))
                 {
-                        {3.9f, 4.2f},
-                        {4.2f, 4.25f},
-                        {4.25f, 4.3f},
-                        {4.3f, 4.35f},
-                        {4.35f, 4.4f},
-                        {4.4f, 4.45f},
-                        {4.45f, 4.5f},
-                        {4.5f, 4.6f},
-                        {4.6f, 4.8f},
-                        {4.8f, 5.0f},
-                        {5.0f, 5.2f}
-                };
+                    // 默认颜色：红色
+                    cv::Scalar color(0, 0, 255);
 
-        int points_per_range = 20;      // 每个区间的采样点数
-        float neighbor_tol = 0.2f;      // 局部邻域内点距离小于该值时，认为该点是同一个点
-        int minDist = 20;               // 相邻点之间的最小距离
+                    // 指定深度段：特殊颜色（例如绿色）
+                    if (d >= specialDepthMin && d <= specialDepthMax)
+                    {
+                        color = cv::Scalar(0, 255, 0);
+                    }
 
-        float init_value_tol_ratio = 0.01f;
-        float max_value_tol_ratio  = 0.05f;
-        float value_tol_step_ratio = 0.001f;
+                    cv::circle(out, cv::Point(x, y), 5, color, -1);
+                }
+            }
+        }
+        return out;
+    }
 
-        //  区域划分
-        int gridCols = 6;               // 划分为n*n
-        int gridRows = 6;
-        int primaryCellsRange = 3;      // primary：只用前几个格子
-        int fallbackExtraCells = 3;     // fallback：额外再放宽几个格子候选
-        float min_gt_valid_ratio = 0.00005f;   // 格子中最小有效GT值比例
-        int min_range_pixel_count = 20;        // 格子中最小有效候选数
+    void RefreshInfoPanel()
+    {
+        ManualUIState& state = GetManualUIState();
 
-        // GT 驱动候选的局部统计参数
-        int vd_patch_radius = 5;
-        int min_vd_neighbors = 3;
-        float max_vd_mad = 0.03f;
-        float max_vd_span = 0.12f;
-        float gt_hist_step_mm = 2000.0f;
+        state.infoPanel = cv::Mat(1100, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
 
-        std::vector<cv::Scalar> colors
-                {
-                        cv::Scalar(255,0,0),
-                        cv::Scalar(0,255,0),
-                        cv::Scalar(0,0,255),
-                        cv::Scalar(0,255,255),
-                        cv::Scalar(255,0,255),
-                        cv::Scalar(255,255,0),
-                        cv::Scalar(200,255,0),
-                        cv::Scalar(100,255,0),
-                        cv::Scalar(200,100,0),
-                        cv::Scalar(100,100,0),
-                        cv::Scalar(255,200,0)
-                };
+        cv::putText(state.infoPanel, "Manual Pair Selection", cv::Point(20, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 0), 2);
 
-        struct Sample
+        cv::putText(state.infoPanel,
+                    "Controls: Left click add circle   Right click or Z/U undo   ESC quit+save   Mouse wheel on InfoPanel to scroll",
+                    cv::Point(20, 70), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(20, 20, 20), 1);
+
+        cv::putText(state.infoPanel, "Left column: VD values / VD RMSE", cv::Point(20, 110),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(160, 0, 0), 2);
+        cv::putText(state.infoPanel, "Right column: REF values / REF RMSE", cv::Point(720, 110),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 100, 0), 2);
+
+        std::string summary =
+                "Selections: " + std::to_string(state.selections.size()) +
+                "   Kept pairs(mean vd, mean ref): " + std::to_string(state.pairRecords.size()) +
+                "   Circle radius: " + std::to_string(state.circleRadius) +
+                "   ScrollOffset: " + std::to_string(state.infoScrollOffset);
+        cv::putText(state.infoPanel, summary, cv::Point(20, 145),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(40, 40, 40), 1);
+
+        int visibleSelections = 3;
+        int totalSelections = static_cast<int>(state.selections.size());
+        int maxOffset = std::max(0, totalSelections - visibleSelections);
+        if (state.infoScrollOffset > maxOffset)
+            state.infoScrollOffset = maxOffset;
+        if (state.infoScrollOffset < 0)
+            state.infoScrollOffset = 0;
+
+        int startRow = state.infoScrollOffset;
+        int endRow = std::min(totalSelections, startRow + visibleSelections);
+
+        int y = 185;
+
+        for (int i = startRow; i < endRow; ++i)
         {
-            int colIndex;
-            int rowIndex;
-            float vDepth;
-            float rDepth;
-        };
+            const ManualSelectionRecord& rec = state.selections[i];
+            int validPairCount = static_cast<int>(rec.pairEnd - rec.pairBegin);
 
-        struct Candidate
+            std::string title =
+                    "#" + std::to_string(i + 1) +
+                    " p=(" + std::to_string(rec.center.x) + "," + std::to_string(rec.center.y) + ")" +
+                    " src=" + rec.sourceWindow +
+                    " n=" + std::to_string(rec.circlePoints.size()) +
+                    " kept=" + std::to_string(validPairCount);
+
+            cv::putText(state.infoPanel, title, cv::Point(20, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(0, 0, 0), 1);
+            y += 26;
+
+            int maxPointLinesToShow = 10;
+            int detailStartY = y;
+
+            for (int k = 0; k < static_cast<int>(rec.vdPointLines.size()) && k < maxPointLinesToShow; ++k)
+            {
+                cv::putText(state.infoPanel, rec.vdPointLines[k], cv::Point(40, detailStartY + k * 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
+            }
+
+            for (int k = 0; k < static_cast<int>(rec.refPointLines.size()) && k < maxPointLinesToShow; ++k)
+            {
+                cv::putText(state.infoPanel, rec.refPointLines[k], cv::Point(720, detailStartY + k * 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(80, 80, 80), 1);
+            }
+
+            if (static_cast<int>(rec.vdPointLines.size()) > maxPointLinesToShow)
+            {
+                std::string moreLeft =
+                        "... " + std::to_string(rec.vdPointLines.size() - maxPointLinesToShow) + " more vd points";
+                cv::putText(state.infoPanel, moreLeft, cv::Point(40, detailStartY + maxPointLinesToShow * 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
+            }
+
+            if (static_cast<int>(rec.refPointLines.size()) > maxPointLinesToShow)
+            {
+                std::string moreRight =
+                        "... " + std::to_string(rec.refPointLines.size() - maxPointLinesToShow) + " more ref points";
+                cv::putText(state.infoPanel, moreRight, cv::Point(720, detailStartY + maxPointLinesToShow * 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(120, 120, 120), 1);
+            }
+
+            y = detailStartY + (maxPointLinesToShow + 1) * 22;
+
+            std::string leftRmse =
+                    "VD  : count=" + std::to_string(rec.vdValues.size()) +
+                    "  mean=" + std::to_string(ComputeMeanFromValidValues(rec.vdValues)) +
+                    "  rmse=" + std::to_string(rec.vdRmse);
+
+            std::string rightRmse =
+                    "REF : count=" + std::to_string(rec.refValues.size()) +
+                    "  mean=" + std::to_string(ComputeMeanFromValidValues(rec.refValues)) +
+                    "  rmse=" + std::to_string(rec.refRmse);
+
+            cv::putText(state.infoPanel, leftRmse, cv::Point(40, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(160, 0, 0), 1);
+
+            cv::putText(state.infoPanel, rightRmse, cv::Point(720, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(0, 120, 0), 1);
+
+            y += 42;
+
+            if (y > state.infoPanel.rows - 40)
+                break;
+        }
+    }
+
+    void RefreshManualWindows()
+    {
+        ManualUIState& state = GetManualUIState();
+
+        state.refFocusShow = state.refFocusBase.clone();
+        state.virtualColorShow = state.virtualColorBase.clone();
+
+        for (size_t i = 0; i < state.selections.size(); ++i)
         {
-            int x;
-            int y;
-            float v;
-            float gt;
-            int gx;
-            int gy;
-            float score;
-            float base_score;
-            float vd_mad;
-            float vd_span;
-            int vd_count;
-            int cell_id;
-        };
+            const ManualSelectionRecord& rec = state.selections[i];
+            cv::Scalar color = (i + 1 == state.selections.size()) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
 
-        struct BehaviorSegmentResult
+            cv::circle(state.refFocusShow, rec.center, state.circleRadius, color, 2);
+            cv::circle(state.refFocusShow, rec.center, 3, cv::Scalar(255, 0, 0), -1);
+
+            cv::circle(state.virtualColorShow, rec.center, state.circleRadius, color, 2);
+            cv::circle(state.virtualColorShow, rec.center, 3, cv::Scalar(255, 0, 0), -1);
+
+            std::string idx = std::to_string(static_cast<int>(i + 1));
+            cv::putText(state.refFocusShow, idx, rec.center + cv::Point(5, -5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+            cv::putText(state.virtualColorShow, idx, rec.center + cv::Point(5, -5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+        }
+
+        if (state.hoverValid)
         {
-            float vdepthMin;
-            float vdepthMax;
-            int sampleCount;
-            std::array<double, 3> params;
-        };
+            std::string hoverText =
+                    "hover ref mean = " + std::to_string(state.hoverRefMean) +
+                    "  at (" + std::to_string(state.hoverPoint.x) + "," + std::to_string(state.hoverPoint.y) + ")";
+            cv::putText(state.refFocusShow, hoverText, cv::Point(30, 100),
+                        cv::FONT_HERSHEY_SIMPLEX, 4, cv::Scalar(255, 0, 255), 4);
+        }
 
-        struct CellInfo
-        {
-            int id;
-            int x0;
-            int y0;
-            int x1;
-            int y1;
+        RefreshInfoPanel();
 
-            int total_pixels;
-            int valid_v_pixels;
-            int valid_gt_pixels;
+        cv::imshow("FocusImage", state.refFocusShow);
+        cv::imshow("VirtualDepthColor", state.virtualColorShow);
+        cv::imshow("InfoPanel", state.infoPanel);
+    }
 
-            float valid_gt_ratio;
-
-            int range_pixel_count;
-            float range_mean_v;
-            float priority_score;
-        };
-
-        struct PatchStats
-        {
-            bool valid;
-            int count;
-            float median;
-            float q10;
-            float q90;
-            float mad;
-        };
-
-        struct GTBandInfo
-        {
-            bool valid;
-            float peak_center;
-            float center;
-            float low;
-            float high;
-            int peak_count;
-        };
-
-        cv::Mat depth = imread(vdepth_path, cv::IMREAD_UNCHANGED);
-        if (depth.empty())
-        {
-            std::cout << "无法读取虚拟深度图" << std::endl;
+    void UndoLastManualSelection()
+    {
+        ManualUIState& state = GetManualUIState();
+        if (state.selections.empty())
             return;
-        }
-        if (depth.channels() > 1)
-            extractChannel(depth, depth, 0);
-        depth.convertTo(depth, CV_32F);
 
-        cv::Mat gt = imread(gt_path, cv::IMREAD_UNCHANGED);
-        if (gt.empty())
-        {
-            std::cout << "无法读取GT" << std::endl;
+        ManualSelectionRecord rec = state.selections.back();
+        state.selections.pop_back();
+
+        if (rec.pairBegin < state.pairRecords.size())
+            state.pairRecords.resize(rec.pairBegin);
+
+        RefreshManualWindows();
+    }
+
+    void HandleManualClick(int x, int y, const std::string& sourceWindow)
+    {
+        ManualUIState& state = GetManualUIState();
+
+        if (state.refDepth32F.empty() || state.virtualDepth32F.empty())
             return;
+        if (x < 0 || y < 0 || x >= state.refDepth32F.cols || y >= state.refDepth32F.rows)
+            return;
+
+        ManualSelectionRecord rec;
+        rec.center = cv::Point(x, y);
+        rec.sourceWindow = sourceWindow;
+        rec.circlePoints = CollectCirclePoints(rec.center, state.circleRadius, state.refDepth32F.size());
+
+        rec.vdRmse = ComputeLocalRMSE(state.virtualDepth32F, rec.circlePoints, rec.center, rec.vdValues);
+        rec.refRmse = ComputeLocalRMSE(state.refDepth32F, rec.circlePoints, rec.center, rec.refValues);
+
+        rec.pairBegin = state.pairRecords.size();
+        rec.vdPointLines.clear();
+        rec.refPointLines.clear();
+
+        for (size_t i = 0; i < rec.circlePoints.size(); ++i)
+        {
+            const cv::Point& p = rec.circlePoints[i];
+            float vd = ReadDepthValue(state.virtualDepth32F, p.x, p.y);
+            float ref = ReadDepthValue(state.refDepth32F, p.x, p.y);
+
+            if (vd > 0.0f)
+            {
+                std::string vdLine =
+                        "(" + std::to_string(p.x) + "," + std::to_string(p.y) + ")" +
+                        "  vd=" + std::to_string(vd);
+                rec.vdPointLines.push_back(vdLine);
+            }
+
+            if (ref > 0.0f)
+            {
+                std::string refLine =
+                        "(" + std::to_string(p.x) + "," + std::to_string(p.y) + ")" +
+                        "  ref=" + std::to_string(ref);
+                rec.refPointLines.push_back(refLine);
+            }
         }
-        if (gt.channels() > 1)
-            extractChannel(gt, gt, 0);
-        gt.convertTo(gt, CV_32F);
 
-        cv::Mat vis;
+        bool vdRmseOk = (rec.vdRmse > 0.0 && rec.vdRmse <= 0.06);
+        bool refRmseOk = (rec.refRmse > 0.0 && rec.refRmse <= 1000.0);
+
+        if (vdRmseOk && refRmseOk && !rec.vdValues.empty() && !rec.refValues.empty())
         {
-            boost::filesystem::path depth_path(vdepth_path);
-            boost::filesystem::path vis_path = depth_path.parent_path() / "fullfocus.png";
-
-            vis = cv::imread(vis_path.string(), cv::IMREAD_COLOR);
-            if (vis.empty())
-                std::cout << "无法读取可视化全聚焦图" << std::endl;
+            ManualPairRecord pairRec;
+            pairRec.selectionIndex = static_cast<int>(state.selections.size());
+            pairRec.pt = rec.center;
+            pairRec.vdMean = static_cast<float>(ComputeMeanFromValidValues(rec.vdValues));
+            pairRec.refMean = static_cast<float>(ComputeMeanFromValidValues(rec.refValues));
+            pairRec.vdRmse = rec.vdRmse;
+            pairRec.refRmse = rec.refRmse;
+            state.pairRecords.push_back(pairRec);
         }
 
-        std::vector<Sample> samples;
-        std::vector<cv::Point> selected_points;
-        std::vector<BehaviorSegmentResult> segment_results;
+        rec.pairEnd = state.pairRecords.size();
+        state.selections.push_back(rec);
 
-        int w = depth.cols;
-        int h = depth.rows;
+        RefreshManualWindows();
+    }
 
-        int cell_w = std::max(1, (w + gridCols - 1) / gridCols);
-        int cell_h = std::max(1, (h + gridRows - 1) / gridRows);
+    void OnMouseFocus(int event, int x, int y, int flags, void* userdata)
+    {
+        (void)flags;
+        (void)userdata;
 
-        (void)init_value_tol_ratio;
-        (void)max_value_tol_ratio;
-        (void)value_tol_step_ratio;
+        ManualUIState& state = GetManualUIState();
 
-//----------------------------局部lambda变量(主函数在后面)------------------------------
-        auto getQuantileFromSorted = [&](const std::vector<float>& vals, float q) -> float
+        if (event == cv::EVENT_MOUSEMOVE)
         {
-            if (vals.empty())
-                return 0.0f;
-            if (vals.size() == 1)
-                return vals[0];
-
-            float pos = q * static_cast<float>(vals.size() - 1);
-            int lo = static_cast<int>(std::floor(pos));
-            int hi = static_cast<int>(std::ceil(pos));
-            float t = pos - static_cast<float>(lo);
-
-            if (lo == hi)
-                return vals[lo];
-            return vals[lo] * (1.0f - t) + vals[hi] * t;
-        };
-
-        // 保证选取的点之间至少有minDist个像素的距离，避免重合
-        auto isFarEnough = [&](int x, int y) -> bool
-        {
-            for (const auto& p : selected_points)
-            {
-                int dx = p.x - x;
-                int dy = p.y - y;
-                if (dx * dx + dy * dy < minDist * minDist)
-                    return false;
-            }
-            return true;
-        };
-
-        auto isFinitePositive = [&](float v) -> bool
-        {
-            return std::isfinite(v) && v > 0.0f;
-        };
-
-        auto getCellId = [&](int x, int y) -> int
-        {
-            int cx = std::min(gridCols - 1, std::max(0, x / cell_w));
-            int cy = std::min(gridRows - 1, std::max(0, y / cell_h));
-            return cy * gridCols + cx;
-        };
-
-        auto computePatchStats = [&](const cv::Mat& src, int x, int y, int radius) -> PatchStats
-        {
-            PatchStats st;
-            st.valid = false;
-            st.count = 0;
-            st.median = 0.0f;
-            st.q10 = 0.0f;
-            st.q90 = 0.0f;
-            st.mad = 0.0f;
-
-            int x0 = std::max(0, x - radius);
-            int x1 = std::min(src.cols - 1, x + radius);
-            int y0 = std::max(0, y - radius);
-            int y1 = std::min(src.rows - 1, y + radius);
-
-            std::vector<float> vals;
-            vals.reserve((2 * radius + 1) * (2 * radius + 1));
-
-            for (int yy = y0; yy <= y1; ++yy)
-            {
-                for (int xx = x0; xx <= x1; ++xx)
-                {
-                    float v = src.at<float>(yy, xx);
-                    if (!isFinitePositive(v))
-                        continue;
-                    vals.push_back(v);
-                }
-            }
-
-            if (vals.empty())
-                return st;
-
-            std::sort(vals.begin(), vals.end());
-            st.count = static_cast<int>(vals.size());
-            st.median = getQuantileFromSorted(vals, 0.5f);
-            st.q10 = getQuantileFromSorted(vals, 0.1f);
-            st.q90 = getQuantileFromSorted(vals, 0.9f);
-
-            std::vector<float> abs_dev;
-            abs_dev.reserve(vals.size());
-            for (size_t i = 0; i < vals.size(); ++i)
-                abs_dev.push_back(std::fabs(vals[i] - st.median));
-            std::sort(abs_dev.begin(), abs_dev.end());
-            st.mad = getQuantileFromSorted(abs_dev, 0.5f);
-            st.valid = true;
-            return st;
-        };
-
-        // 从 GT 像素出发，在 GT 点周围取一个鲁棒的 vd 值
-        auto findRobustVDValueAroundGT = [&](int gt_x,
-                                             int gt_y,
-                                             float& vd_value,
-                                             float& vd_mad,
-                                             float& vd_span,
-                                             int& vd_cnt) -> bool
-        {
-            PatchStats st = computePatchStats(depth, gt_x, gt_y, vd_patch_radius);
-            if (!st.valid)
-                return false;
-
-            vd_cnt = st.count;
-            vd_mad = st.mad;
-            vd_span = st.q90 - st.q10;
-
-            if (vd_cnt < min_vd_neighbors)
-                return false;
-            if (vd_mad > max_vd_mad)
-                return false;
-            if (vd_span > max_vd_span)
-                return false;
-
-            float center_v = depth.at<float>(gt_y, gt_x);
-            bool use_center = false;
-
-            if (isFinitePositive(center_v))
-            {
-                float center_tol = std::max(0.03f, st.mad * 3.0f + 0.02f);
-                if (std::fabs(center_v - st.median) <= center_tol &&
-                    isValidPixel(depth, gt_x, gt_y, center_v, neighbor_tol))
-                {
-                    use_center = true;
-                }
-            }
-
-            vd_value = use_center ? center_v : st.median;
-            return true;
-        };
-
-        // 把整张图划分为 n*n 个格子，并统计每个格子的基础信息
-        auto buildCells = [&]() -> std::vector<CellInfo>
-        {
-            std::vector<CellInfo> cells;
-            cells.reserve(gridCols * gridRows);
-
-            for (int gy = 0; gy < gridRows; ++gy)
-            {
-                for (int gx = 0; gx < gridCols; ++gx)
-                {
-                    CellInfo c;
-                    c.id = gy * gridCols + gx;
-                    c.x0 = gx * cell_w;
-                    c.y0 = gy * cell_h;
-                    c.x1 = std::min(w, (gx + 1) * cell_w);
-                    c.y1 = std::min(h, (gy + 1) * cell_h);
-
-                    c.total_pixels = 0;
-                    c.valid_v_pixels = 0;
-                    c.valid_gt_pixels = 0;
-                    c.valid_gt_ratio = 0.0f;
-                    c.range_pixel_count = 0;
-                    c.range_mean_v = 0.0f;
-                    c.priority_score = -1e9f;
-
-                    for (int y = c.y0; y < c.y1; ++y)
-                    {
-                        for (int x = c.x0; x < c.x1; ++x)
-                        {
-                            c.total_pixels++;
-
-                            float vv = depth.at<float>(y, x);
-                            if (isFinitePositive(vv))
-                                c.valid_v_pixels++;
-
-                            float gv = gt.at<float>(y, x);
-                            if (isFinitePositive(gv))
-                                c.valid_gt_pixels++;
-                        }
-                    }
-
-                    if (c.valid_v_pixels > 0)
-                        c.valid_gt_ratio = static_cast<float>(c.valid_gt_pixels) / c.valid_v_pixels;
-                    else
-                        c.valid_gt_ratio = 0.0f;
-
-                    cells.push_back(c);
-                }
-            }
-
-            return cells;
-        };
-
-        // 先一次性构造 GT 驱动候选，后续各个 vd 区间直接从这里筛
-        auto buildGlobalCandidates = [&]() -> std::vector<Candidate>
-        {
-            std::vector<Candidate> out_candidates;
-            out_candidates.reserve(50000);
-
-            for (int y = 0; y < h; ++y)
-            {
-                for (int x = 0; x < w; ++x)
-                {
-                    float gt_value = gt.at<float>(y, x);
-                    if (!isFinitePositive(gt_value))
-                        continue;
-
-                    float vd_value = 0.0f;
-                    float vd_mad = 0.0f;
-                    float vd_span = 0.0f;
-                    int vd_cnt = 0;
-
-                    if (!findRobustVDValueAroundGT(x, y, vd_value, vd_mad, vd_span, vd_cnt))
-                        continue;
-
-                    Candidate c;
-                    c.x = x;
-                    c.y = y;
-                    c.v = vd_value;
-                    c.gt = gt_value;
-                    c.gx = x;
-                    c.gy = y;
-                    c.vd_mad = vd_mad;
-                    c.vd_span = vd_span;
-                    c.vd_count = vd_cnt;
-                    c.base_score = vd_mad * 10.0f + vd_span * 3.0f;
-                    c.score = c.base_score;
-                    c.cell_id = getCellId(x, y);
-
-                    out_candidates.push_back(c);
-                }
-            }
-
-            return out_candidates;
-        };
-
-        auto estimateCleanGTBand = [&](const std::vector<Candidate>& range_candidates) -> GTBandInfo
-        {
-            GTBandInfo band;
-            band.valid = false;
-            band.peak_center = 0.0f;
-            band.center = 0.0f;
-            band.low = 0.0f;
-            band.high = 0.0f;
-            band.peak_count = 0;
-
-            if (range_candidates.empty())
-                return band;
-
-            std::vector<float> gt_values;
-            gt_values.reserve(range_candidates.size());
-            float min_gt = std::numeric_limits<float>::max();
-            float max_gt = 0.0f;
-
-            for (size_t i = 0; i < range_candidates.size(); ++i)
-            {
-                gt_values.push_back(range_candidates[i].gt);
-                min_gt = std::min(min_gt, range_candidates[i].gt);
-                max_gt = std::max(max_gt, range_candidates[i].gt);
-            }
-
-            std::sort(gt_values.begin(), gt_values.end());
-            float median_gt = getQuantileFromSorted(gt_values, 0.5f);
-
-            float hist_start = std::floor(std::max(0.0f, min_gt - gt_hist_step_mm) / gt_hist_step_mm) * gt_hist_step_mm;
-            float hist_end = std::ceil((max_gt + gt_hist_step_mm) / gt_hist_step_mm) * gt_hist_step_mm;
-            if (hist_end <= hist_start)
-                hist_end = hist_start + gt_hist_step_mm;
-
-            int hist_bins = std::max(1, static_cast<int>(std::ceil((hist_end - hist_start) / gt_hist_step_mm)));
-            std::vector<int> hist(hist_bins, 0);
-
-            auto toHistBin = [&](float g) -> int
-            {
-                int idx = static_cast<int>(std::floor((g - hist_start) / gt_hist_step_mm));
-                idx = std::max(0, std::min(hist_bins - 1, idx));
-                return idx;
-            };
-
-            for (size_t i = 0; i < range_candidates.size(); ++i)
-                hist[toHistBin(range_candidates[i].gt)]++;
-
-            std::vector<int> peak_bins;
-            peak_bins.reserve(hist_bins);
-            for (int i = 0; i < hist_bins; ++i)
-            {
-                if (hist[i] <= 0)
-                    continue;
-
-                int left = (i > 0) ? hist[i - 1] : -1;
-                int right = (i + 1 < hist_bins) ? hist[i + 1] : -1;
-                if (hist[i] >= left && hist[i] >= right)
-                    peak_bins.push_back(i);
-            }
-
-            int selected_peak = -1;
-            if (!peak_bins.empty())
-            {
-                float best_dist = std::numeric_limits<float>::max();
-                int best_count = -1;
-
-                for (size_t i = 0; i < peak_bins.size(); ++i)
-                {
-                    int bin_id = peak_bins[i];
-                    float center = hist_start + (bin_id + 0.5f) * gt_hist_step_mm;
-                    float dist = std::fabs(center - median_gt);
-
-                    if (dist < best_dist - 1e-6f)
-                    {
-                        best_dist = dist;
-                        best_count = hist[bin_id];
-                        selected_peak = bin_id;
-                    }
-                    else if (std::fabs(dist - best_dist) <= 1e-6f)
-                    {
-                        if (hist[bin_id] > best_count)
-                        {
-                            best_count = hist[bin_id];
-                            selected_peak = bin_id;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                selected_peak = toHistBin(median_gt);
-            }
-
-            if (selected_peak < 0 || selected_peak >= hist_bins)
-                return band;
-
-            float peak_center = hist_start + (selected_peak + 0.5f) * gt_hist_step_mm;
-
-            float half_width = 5000.0f;
-            if (peak_center >= 50000.0f)
-                half_width = 4000.0f;
-            else if (peak_center >= 30000.0f)
-                half_width = 6000.0f;
-            else if (peak_center >= 20000.0f)
-                half_width = 5500.0f;
-            else
-                half_width = 4500.0f;
-
-            float low = std::max(hist_start, peak_center - half_width);
-            float high = std::min(hist_end, peak_center + half_width);
-
-            std::vector<float> inlier_gt;
-            inlier_gt.reserve(range_candidates.size());
-            for (size_t i = 0; i < range_candidates.size(); ++i)
-            {
-                float g = range_candidates[i].gt;
-                if (g >= low && g < high)
-                    inlier_gt.push_back(g);
-            }
-
-            if (inlier_gt.empty())
-                return band;
-
-            std::sort(inlier_gt.begin(), inlier_gt.end());
-            float refined_center = getQuantileFromSorted(inlier_gt, 0.5f);
-
-            low = std::max(hist_start, refined_center - half_width);
-            high = std::min(hist_end, refined_center + half_width);
-
-            band.valid = true;
-            band.peak_center = peak_center;
-            band.center = refined_center;
-            band.low = low;
-            band.high = high;
-            band.peak_count = hist[selected_peak];
-            return band;
-        };
-
-        // 统计格子区间的均值等，获取格子优先级
-        auto updateCellsForRange = [&](std::vector<CellInfo>& cells,
-                                       const std::vector<Candidate>& range_candidates)
-        {
-            for (size_t i = 0; i < cells.size(); ++i)
-            {
-                cells[i].range_pixel_count = 0;
-                cells[i].range_mean_v = 0.0f;
-                cells[i].priority_score = -1e9f;
-            }
-
-            std::vector<double> v_sum(cells.size(), 0.0);
-
-            for (size_t i = 0; i < range_candidates.size(); ++i)
-            {
-                int id = range_candidates[i].cell_id;
-                if (id < 0 || id >= static_cast<int>(cells.size()))
-                    continue;
-
-                cells[id].range_pixel_count++;
-                v_sum[id] += range_candidates[i].v;
-            }
-
-            for (size_t i = 0; i < cells.size(); ++i)
-            {
-                if (cells[i].range_pixel_count > 0)
-                    cells[i].range_mean_v = static_cast<float>(v_sum[i] / cells[i].range_pixel_count);
-
-                if (cells[i].range_pixel_count >= min_range_pixel_count &&
-                    cells[i].valid_gt_ratio >= min_gt_valid_ratio)
-                {
-                    cells[i].priority_score =
-                            static_cast<float>(cells[i].range_pixel_count) +
-                            cells[i].valid_gt_ratio * 1000.0f;
-                }
-            }
-        };
-
-        // 从格子中选择候选拟合点（这里直接从 GT 驱动的候选池中过滤）
-        auto collectCandidatesInCell = [&](const CellInfo& cell,
-                                           float rmin,
-                                           float rmax,
-                                           const GTBandInfo& gt_band,
-                                           const std::vector<Candidate>& range_candidates,
-                                           std::vector<Candidate>& out_candidates)
-        {
-            float center_v = 0.5f * (rmin + rmax);
-
-            for (size_t i = 0; i < range_candidates.size(); ++i)
-            {
-                const Candidate& src = range_candidates[i];
-                if (src.cell_id != cell.id)
-                    continue;
-
-                Candidate c = src;
-                c.score = c.base_score +
-                          std::fabs(c.v - center_v) * 10.0f +
-                          std::fabs(c.gt - gt_band.center) / 3000.0f;
-
-                out_candidates.push_back(c);
-            }
-        };
-
-        // 被选取参与拟合的点，在全聚焦图像用不同颜色标注
-        auto addSampleToVis = [&](int idx, int selected_in_range, const cv::Scalar& color, const Candidate& c)
-        {
-            if (vis.empty())
+            if (x < 0 || y < 0 || x >= state.refDepth32F.cols || y >= state.refDepth32F.rows)
                 return;
 
-            cv::circle(vis, cv::Point(c.x, c.y), 6, color, 2);
+            auto now = std::chrono::steady_clock::now();
 
-            std::string label = std::to_string(idx) + "-" + std::to_string(selected_in_range);
-            cv::putText(vis, label, cv::Point(c.x + 5, c.y - 5),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv::LINE_AA);
-        };
-
-        auto sortCandidatesDeterministic = [&](std::vector<Candidate>& candidates)
-        {
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const Candidate& a, const Candidate& b)
-                      {
-                          if (std::fabs(a.score - b.score) > 1e-6f)
-                              return a.score < b.score;
-                          if (a.cell_id != b.cell_id)
-                              return a.cell_id < b.cell_id;
-                          if (a.y != b.y)
-                              return a.y < b.y;
-                          return a.x < b.x;
-                      });
-        };
-
-        auto pickCandidatesRoundRobin = [&](const std::vector<CellInfo>& cell_list,
-                                            const std::vector<Candidate>& candidate_pool,
-                                            int idx,
-                                            const cv::Scalar& color,
-                                            int& selected_in_range,
-                                            std::vector<Sample>& range_samples,
-                                            bool is_fallback)
-        {
-            std::map<int, std::vector<Candidate> > by_cell;
-            for (size_t i = 0; i < candidate_pool.size(); ++i)
-                by_cell[candidate_pool[i].cell_id].push_back(candidate_pool[i]);
-
-            for (std::map<int, std::vector<Candidate> >::iterator it = by_cell.begin(); it != by_cell.end(); ++it)
-                sortCandidatesDeterministic(it->second);
-
-            std::vector<size_t> cursor(cell_list.size(), 0);
-
-            bool progress = true;
-            while ((int)range_samples.size() < points_per_range && progress)
+            if (!state.hoverTimeInitialized)
             {
-                progress = false;
-
-                for (size_t i = 0; i < cell_list.size(); ++i)
-                {
-                    int cell_id = cell_list[i].id;
-                    std::map<int, std::vector<Candidate> >::iterator it = by_cell.find(cell_id);
-                    if (it == by_cell.end())
-                        continue;
-
-                    std::vector<Candidate>& vec = it->second;
-                    while (cursor[i] < vec.size())
-                    {
-                        const Candidate& c = vec[cursor[i]++];
-                        if (!isFarEnough(c.x, c.y))
-                            continue;
-
-                        Sample s;
-                        s.colIndex = c.x;
-                        s.rowIndex = c.y;
-                        s.vDepth = c.v;
-                        s.rDepth = c.gt;
-
-                        samples.push_back(s);
-                        range_samples.push_back(s);
-                        selected_points.push_back(cv::Point(c.x, c.y));
-                        addSampleToVis(idx, selected_in_range, color, c);
-
-                        if (!is_fallback)
-                        {
-                            std::cout << "    pick: x=" << c.x
-                                      << " y=" << c.y
-                                      << " V=" << c.v
-                                      << " GT=" << c.gt
-                                      << " cell=" << c.cell_id
-                                      << " score=" << c.score
-                                      << std::endl;
-                        }
-                        else
-                        {
-                            std::cout << "    fallback pick: x=" << c.x
-                                      << " y=" << c.y
-                                      << " V=" << c.v
-                                      << " GT=" << c.gt
-                                      << " cell=" << c.cell_id
-                                      << " score=" << c.score
-                                      << std::endl;
-                        }
-
-                        selected_in_range++;
-                        progress = true;
-                        break;
-                    }
-
-                    if ((int)range_samples.size() >= points_per_range)
-                        break;
-                }
-            }
-        };
-//----------------------------------------------------------
-        std::vector<Candidate> global_candidates = buildGlobalCandidates();
-        std::cout << "GT-driven candidate pool: " << global_candidates.size() << std::endl;
-
-        //  主函数开始
-        for (int idx = 0; idx < (int)ranges.size(); ++idx)
-        {
-            float rmin = ranges[idx].first;
-            float rmax = ranges[idx].second;
-
-            std::cout << "Range " << rmin << "-" << rmax << std::endl;
-
-            cv::Scalar color = colors[idx % colors.size()];
-            int selected_in_range = 0;
-
-            std::vector<Sample> range_samples;
-
-            // Step 0: 先按 vd 区间收一遍 GT 驱动候选
-            std::vector<Candidate> range_candidates_raw;
-            range_candidates_raw.reserve(global_candidates.size() / 4 + 1);
-
-            for (size_t i = 0; i < global_candidates.size(); ++i)
-            {
-                if (global_candidates[i].v >= rmin && global_candidates[i].v < rmax)
-                    range_candidates_raw.push_back(global_candidates[i]);
+                state.lastHoverUpdateTime = now;
+                state.hoverTimeInitialized = true;
             }
 
-            if (range_candidates_raw.empty())
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - state.lastHoverUpdateTime).count();
+
+            // 距离上次更新时间不足 5 秒，不重算
+            if (elapsedMs < 3000)
+                return;
+
+            state.lastHoverUpdateTime = now;
+            state.hoverPoint = cv::Point(x, y);
+
+            std::vector<cv::Point> hoverCircle =
+                    CollectCirclePoints(state.hoverPoint, state.circleRadius, state.refDepth32F.size());
+
+            state.hoverRefMean = ComputeHoverRefMean(state.refDepth32F, hoverCircle);
+            state.hoverValid = true;
+
+            RefreshManualWindows();
+        }
+        else if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            HandleManualClick(x, y, "Focus");
+        }
+        else if (event == cv::EVENT_RBUTTONDOWN)
+        {
+            UndoLastManualSelection();
+        }
+    }
+
+    void OnMouseVirtual(int event, int x, int y, int flags, void* userdata)
+    {
+        (void)flags;
+        (void)userdata;
+
+        if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            HandleManualClick(x, y, "Virtual");
+        }
+        else if (event == cv::EVENT_RBUTTONDOWN)
+        {
+            UndoLastManualSelection();
+        }
+    }
+
+    void OnMouseInfoPanel(int event, int x, int y, int flags, void* userdata)
+    {
+        (void)x;
+        (void)y;
+        (void)userdata;
+
+        ManualUIState& state = GetManualUIState();
+
+        if (event == cv::EVENT_MOUSEWHEEL)
+        {
+            int delta = cv::getMouseWheelDelta(flags);
+
+            if (delta > 0)
+                state.infoScrollOffset = std::max(0, state.infoScrollOffset - 1);
+            else if (delta < 0)
+                state.infoScrollOffset += 1;
+
+            RefreshManualWindows();
+        }
+    }
+
+    void SaveManualPairsAndScatter()
+    {
+        ManualUIState& state = GetManualUIState();
+
+        {
+            std::ofstream ofs(state.outputTxtPath.c_str());
+            ofs << "# selection_index x y vd_mean ref_mean_mm vd_rmse ref_rmse\n";
+            for (size_t i = 0; i < state.pairRecords.size(); ++i)
             {
-                std::cout << "  no GT-driven candidates for this range." << std::endl;
+                const ManualPairRecord& rec = state.pairRecords[i];
+                ofs << rec.selectionIndex << " "
+                    << rec.pt.x << " "
+                    << rec.pt.y << " "
+                    << rec.vdMean << " "
+                    << rec.refMean << " "
+                    << rec.vdRmse << " "
+                    << rec.refRmse << "\n";
+            }
+            ofs.close();
+        }
+
+        cv::Mat scatter(900, 1200, CV_8UC3, cv::Scalar(255, 255, 255));
+
+        if (state.pairRecords.empty())
+        {
+            cv::putText(scatter, "No valid mean (vd, ref) pairs collected.",
+                        cv::Point(120, 450), cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                        cv::Scalar(0, 0, 0), 2);
+            cv::imwrite(state.outputScatterPath, scatter);
+            return;
+        }
+
+        float minVd = std::numeric_limits<float>::max();
+        float maxVd = std::numeric_limits<float>::lowest();
+        float minRef = std::numeric_limits<float>::max();
+        float maxRef = std::numeric_limits<float>::lowest();
+
+        for (size_t i = 0; i < state.pairRecords.size(); ++i)
+        {
+            minVd = std::min(minVd, state.pairRecords[i].vdMean);
+            maxVd = std::max(maxVd, state.pairRecords[i].vdMean);
+            minRef = std::min(minRef, state.pairRecords[i].refMean);
+            maxRef = std::max(maxRef, state.pairRecords[i].refMean);
+        }
+
+        if (std::fabs(maxVd - minVd) < 1e-6f)
+            maxVd = minVd + 1.0f;
+        if (std::fabs(maxRef - minRef) < 1e-6f)
+            maxRef = minRef + 1.0f;
+
+        const int left = 100;
+        const int right = 1100;
+        const int top = 80;
+        const int bottom = 780;
+
+        cv::line(scatter, cv::Point(left, bottom), cv::Point(right, bottom), cv::Scalar(0, 0, 0), 2);
+        cv::line(scatter, cv::Point(left, bottom), cv::Point(left, top), cv::Scalar(0, 0, 0), 2);
+
+        for (int i = 0; i <= 5; ++i)
+        {
+            int x = left + (right - left) * i / 5;
+            int y = bottom - (bottom - top) * i / 5;
+
+            cv::line(scatter, cv::Point(x, bottom - 5), cv::Point(x, bottom + 5), cv::Scalar(0, 0, 0), 1);
+            cv::line(scatter, cv::Point(left - 5, y), cv::Point(left + 5, y), cv::Scalar(0, 0, 0), 1);
+
+            float vdTick = minVd + (maxVd - minVd) * static_cast<float>(i) / 5.0f;
+            float refTick = minRef + (maxRef - minRef) * static_cast<float>(5 - i) / 5.0f;
+
+            cv::putText(scatter, std::to_string(vdTick), cv::Point(x - 20, bottom + 30),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 0), 1);
+            cv::putText(scatter, std::to_string(refTick), cv::Point(20, y + 5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 0), 1);
+        }
+
+        for (size_t i = 0; i < state.pairRecords.size(); ++i)
+        {
+            float vd = state.pairRecords[i].vdMean;
+            float ref = state.pairRecords[i].refMean;
+
+            int px = left + static_cast<int>((vd - minVd) / (maxVd - minVd) * (right - left));
+            int py = bottom - static_cast<int>((ref - minRef) / (maxRef - minRef) * (bottom - top));
+
+            px = std::max(left, std::min(right, px));
+            py = std::max(top, std::min(bottom, py));
+
+            cv::circle(scatter, cv::Point(px, py), 3, cv::Scalar(255, 0, 0), -1);
+        }
+
+        cv::putText(scatter, "VD-REF 2D Distribution (Mean Values)", cv::Point(320, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 0), 2);
+        cv::putText(scatter, "x: vd mean (unitless)", cv::Point(450, 860),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 0, 0), 2);
+        cv::putText(scatter, "y: ref mean (mm)", cv::Point(20, 60),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 0, 0), 2);
+
+        cv::imwrite(state.outputScatterPath, scatter);
+    }
+
+    void FitManualBehaviorModelAndWriteXml(VirtualToRealDepthFunc* self)
+    {
+        if (self == nullptr)
+        {
+            std::cerr << "FitManualBehaviorModelAndWriteXml: self is null." << std::endl;
+            return;
+        }
+
+        ManualUIState& state = GetManualUIState();
+
+        std::vector<float> refDepthValue;
+        std::vector<float> virtualDepthValue;
+        refDepthValue.reserve(state.pairRecords.size());
+        virtualDepthValue.reserve(state.pairRecords.size());
+
+        int minGtIndex = -1;
+        int maxGtIndex = -1;
+
+        for (size_t i = 0; i < state.pairRecords.size(); ++i)
+        {
+            const ManualPairRecord& rec = state.pairRecords[i];
+
+            if (!std::isfinite(rec.refMean) || !std::isfinite(rec.vdMean) ||
+                rec.refMean <= 0.0f || rec.vdMean <= 0.0f)
+            {
                 continue;
             }
 
-            GTBandInfo gt_band = estimateCleanGTBand(range_candidates_raw);
-            if (!gt_band.valid)
-            {
-                std::cout << "  failed to estimate GT band for this range." << std::endl;
-                continue;
-            }
+            refDepthValue.push_back(rec.refMean);
+            virtualDepthValue.push_back(rec.vdMean);
 
-            // Step 1: 在当前 vd 区间里，只保留一个连续 GT 子带，避免 GT 多模态污染
-            std::vector<Candidate> range_candidates;
-            range_candidates.reserve(range_candidates_raw.size());
-            for (size_t i = 0; i < range_candidates_raw.size(); ++i)
-            {
-                if (range_candidates_raw[i].gt >= gt_band.low &&
-                    range_candidates_raw[i].gt < gt_band.high)
-                {
-                    range_candidates.push_back(range_candidates_raw[i]);
-                }
-            }
+            int curIdx = static_cast<int>(refDepthValue.size()) - 1;
 
-            if (range_candidates.empty())
-            {
-                std::cout << "  no clean GT-band candidates for this range." << std::endl;
-                continue;
-            }
+            if (minGtIndex < 0 || refDepthValue[curIdx] < refDepthValue[minGtIndex])
+                minGtIndex = curIdx;
 
-            std::cout << "  GT band: [" << gt_band.low << ", " << gt_band.high
-                      << "), center=" << gt_band.center
-                      << ", peakCenter=" << gt_band.peak_center
-                      << ", raw=" << range_candidates_raw.size()
-                      << ", clean=" << range_candidates.size()
+            if (maxGtIndex < 0 || refDepthValue[curIdx] > refDepthValue[maxGtIndex])
+                maxGtIndex = curIdx;
+        }
+
+        if (refDepthValue.size() != virtualDepthValue.size() || refDepthValue.size() < 3)
+        {
+            std::cerr << "FitManualBehaviorModelAndWriteXml: valid pair count is not enough. "
+                      << "refDepthValue.size() = " << refDepthValue.size()
+                      << ", virtualDepthValue.size() = " << virtualDepthValue.size()
                       << std::endl;
-
-            std::vector<CellInfo> cells = buildCells();
-            // Step 1.5: 统计格子区域的均值，计算格子优先级
-            updateCellsForRange(cells, range_candidates);
-
-            std::sort(cells.begin(), cells.end(),
-                      [](const CellInfo& a, const CellInfo& b)
-                      {
-                          if (std::fabs(a.priority_score - b.priority_score) > 1e-6f)
-                              return a.priority_score > b.priority_score;
-                          return a.id < b.id;
-                      });
-
-            std::vector<CellInfo> primary_cells;    // 优先选取格子
-            std::vector<CellInfo> fallback_cells;   // 候选格子
-
-            for (size_t i = 0; i < cells.size(); ++i)
-            {
-                const CellInfo& c = cells[i];
-                if (c.priority_score <= 0.0f)
-                    continue;
-
-                if ((int)primary_cells.size() < primaryCellsRange)
-                {
-                    primary_cells.push_back(c);
-                }
-                else if ((int)fallback_cells.size() < fallbackExtraCells)
-                {
-                    fallback_cells.push_back(c);
-                }
-
-                if ((int)primary_cells.size() >= primaryCellsRange &&
-                    (int)fallback_cells.size() >= fallbackExtraCells)
-                    break;
-            }
-
-            std::cout << "  primary cells: ";
-            for (size_t i = 0; i < primary_cells.size(); ++i)
-            {
-                const CellInfo& c = primary_cells[i];
-                std::cout << "[id=" << c.id
-                          << " rangeCount=" << c.range_pixel_count
-                          << " gtRatio=" << c.valid_gt_ratio
-                          << " meanV=" << c.range_mean_v
-                          << "] ";
-            }
-            std::cout << std::endl;
-
-            std::cout << "  fallback cells: ";
-            for (size_t i = 0; i < fallback_cells.size(); ++i)
-            {
-                const CellInfo& c = fallback_cells[i];
-                std::cout << "[id=" << c.id
-                          << " rangeCount=" << c.range_pixel_count
-                          << " gtRatio=" << c.valid_gt_ratio
-                          << " meanV=" << c.range_mean_v
-                          << "] ";
-            }
-            std::cout << std::endl;
-
-            if (primary_cells.empty())
-            {
-                std::cout << "  no valid primary cells for this range." << std::endl;
-                continue;
-            }
-
-            // Step 2: primary pick拟合点选取：只从 primary格子里挑
-            std::vector<Candidate> primary_candidates;
-            primary_candidates.reserve(50000);
-
-            for (size_t i = 0; i < primary_cells.size(); ++i)
-                collectCandidatesInCell(primary_cells[i], rmin, rmax, gt_band, range_candidates, primary_candidates);
-
-            {
-                std::vector<Candidate> deduped;
-                deduped.reserve(primary_candidates.size());
-                std::set<std::pair<int,int> > used_xy;
-
-                for (size_t i = 0; i < primary_candidates.size(); ++i)
-                {
-                    std::pair<int,int> key(primary_candidates[i].x, primary_candidates[i].y);
-                    if (used_xy.insert(key).second)
-                        deduped.push_back(primary_candidates[i]);
-                }
-
-                primary_candidates.swap(deduped);
-            }
-
-            std::cout << "  primary candidate pool: " << primary_candidates.size() << std::endl;
-            pickCandidatesRoundRobin(primary_cells, primary_candidates, idx, color, selected_in_range, range_samples, false);
-
-            // fallback pick：只从 fallback_cells 里补
-            if ((int)range_samples.size() < points_per_range && !fallback_cells.empty())
-            {
-                std::vector<Candidate> fallback_candidates;
-                fallback_candidates.reserve(50000);
-
-                for (size_t i = 0; i < fallback_cells.size(); ++i)
-                    collectCandidatesInCell(fallback_cells[i], rmin, rmax, gt_band, range_candidates, fallback_candidates);
-
-                {
-                    std::vector<Candidate> deduped;
-                    deduped.reserve(fallback_candidates.size());
-                    std::set<std::pair<int,int> > used_xy;
-
-                    for (size_t i = 0; i < fallback_candidates.size(); ++i)
-                    {
-                        std::pair<int,int> key(fallback_candidates[i].x, fallback_candidates[i].y);
-                        if (used_xy.insert(key).second)
-                            deduped.push_back(fallback_candidates[i]);
-                    }
-
-                    fallback_candidates.swap(deduped);
-                }
-
-                std::cout << "  fallback candidate pool: " << fallback_candidates.size() << std::endl;
-                pickCandidatesRoundRobin(fallback_cells, fallback_candidates, idx, color, selected_in_range, range_samples, true);
-            }
-
-            std::cout << "Range done, selected count: " << selected_in_range << std::endl;
-            // Step 3: 分段拟合行为模型参数
-            if ((int)range_samples.size() >= 3)
-            {
-                std::vector<float> refDepthValue;
-                std::vector<float> virtualDepthValue;
-                refDepthValue.reserve(range_samples.size());
-                virtualDepthValue.reserve(range_samples.size());
-
-                for (size_t i = 0; i < range_samples.size(); ++i)
-                {
-                    virtualDepthValue.push_back(range_samples[i].vDepth);
-                    refDepthValue.push_back(range_samples[i].rDepth);
-                }
-
-                std::array<double, 3> behaviorModelParams =
-                        BehavioralModel(refDepthValue, virtualDepthValue);
-
-                BehaviorSegmentResult seg;
-                seg.vdepthMin = rmin;
-                seg.vdepthMax = rmax;
-                seg.sampleCount = (int)range_samples.size();
-                seg.params = behaviorModelParams;
-                segment_results.push_back(seg);
-
-                std::cout << "  BehavioralModel fitted for range ["
-                          << rmin << ", " << rmax << "], sampleCount="
-                          << range_samples.size()
-                          << ", params=("
-                          << behaviorModelParams[0] << ", "
-                          << behaviorModelParams[1] << ", "
-                          << behaviorModelParams[2] << ")"
-                          << std::endl;
-            }
-            else
-            {
-                std::cout << "  Skip BehavioralModel for range ["
-                          << rmin << ", " << rmax
-                          << "], sampleCount=" << range_samples.size()
-                          << " (require >= 8 samples)" << std::endl;
-            }
+            return;
         }
 
-        if (!vis.empty())
-            imwrite(output_mark_path, vis);
+        std::array<double, 3> behaviorModelParams = self->BehavioralModel(refDepthValue, virtualDepthValue);
 
-        // 记录样本点，写入csv文件中
-        std::ofstream csv(output_csv.c_str());
-        csv << "x,y,virtual_depth,real_depth\n";
-        for (size_t i = 0; i < samples.size(); ++i)
+        float depthMin = virtualDepthValue[maxGtIndex]; // 最大gt对应的vd
+        float depthMax = virtualDepthValue[minGtIndex]; // 最小gt对应的vd
+
+        boost::filesystem::path root_path(self->m_strRootPath);
+        boost::filesystem::path root_path_parent = root_path.parent_path();
+        std::string strCalibPath = root_path_parent.string() + LF_CALIB_FOLDER_NAME;
+        std::string xml_path = strCalibPath + "behaviorModelParamsSegment.xml";
+
+        std::ofstream xml(xml_path.c_str());
+        if (!xml.is_open())
         {
-            csv << samples[i].colIndex << ","
-                << samples[i].rowIndex << ","
-                << samples[i].vDepth << ","
-                << samples[i].rDepth << "\n";
-        }
-        csv.close();
-
-        // Step 4: 写出拟合结果xml文件
-        {
-            std::time_t t = std::time(NULL);
-            std::tm tm_now;
-            localtime_r(&t, &tm_now);
-
-            char time_buf[32] = {0};
-            std::strftime(time_buf, sizeof(time_buf), "%Y%m%d_%H%M%S", &tm_now);
-
-            std::string xml_path;
-            {
-                boost::filesystem::path csv_path(output_csv);
-                boost::filesystem::path parent_dir = csv_path.parent_path();
-                xml_path = (parent_dir / ("behaviorModelParams_" + std::string(time_buf) + ".xml")).string();
-            }
-
-            std::ofstream xml(xml_path.c_str());
-            if (!xml.is_open())
-            {
-                std::cerr << "无法写入 XML: " << xml_path << std::endl;
-            }
-            else
-            {
-                xml << std::fixed << std::setprecision(6);
-
-                xml << "<?xml version=\"1.0\"?>\n";
-                xml << "<opencv_storage>\n";
-                xml << "    <BehaviorModelSegments>\n\n";
-
-                for (size_t i = 0; i < segment_results.size(); ++i)
-                {
-                    const BehaviorSegmentResult& seg = segment_results[i];
-                    xml << "        <Segment>\n";
-                    xml << "            <DepthMin>" << seg.vdepthMin << "</DepthMin>\n";
-                    xml << "            <DepthMax>" << seg.vdepthMax << "</DepthMax>\n\n";
-                    xml << "            <Param>\n";
-                    xml << "                <c0>" << seg.params[0] << "</c0>\n";
-                    xml << "                <c1>" << seg.params[1] << "</c1>\n";
-                    xml << "                <c2>" << seg.params[2] << "</c2>\n";
-                    xml << "            </Param>\n";
-                    xml << "        </Segment>\n\n";
-                }
-
-                xml << "    </BehaviorModelSegments>\n";
-                xml << "</opencv_storage>\n";
-                xml.close();
-
-                std::cout << "Behavior model XML saved: " << xml_path << std::endl;
-            }
+            std::cerr << "无法写入 XML: " << xml_path << std::endl;
+            return;
         }
 
-        std::cout << "CSV保存: " << output_csv << std::endl;
-        std::cout << "采样完成，总点数: " << samples.size() << std::endl;
-    }*/
+        xml << std::fixed << std::setprecision(6);
+        xml << "<?xml version=\"1.0\"?>\n";
+        xml << "<opencv_storage>\n";
+        xml << "    <BehaviorModelSegments>\n\n";
 
-// 获取局部稳定vd像素点
-    /*bool VirtualToRealDepthFunc::isValidPixel(
-            cv::Mat& depth, int x, int y, float value, float neighbor_tol)
-    {
-        int w = depth.cols;
-        int h = depth.rows;
+        xml << "        <Segment>\n";
+        xml << "            <DepthMin>" << depthMin << "</DepthMin>\n";
+        xml << "            <DepthMax>" << depthMax << "</DepthMax>\n\n";
+        xml << "            <Param>\n";
+        xml << "                <c0>" << behaviorModelParams[0] << "</c0>\n";
+        xml << "                <c1>" << behaviorModelParams[1] << "</c1>\n";
+        xml << "                <c2>" << behaviorModelParams[2] << "</c2>\n";
+        xml << "            </Param>\n";
+        xml << "        </Segment>\n\n";
 
-        int valid_cnt = 0;
-        int consistent_cnt = 0;
-        float diff_sum = 0.0f;
-        float max_diff = 0.0f;
+        xml << "    </BehaviorModelSegments>\n";
+        xml << "</opencv_storage>\n";
+        xml.close();
 
-        float tol = std::max(neighbor_tol, std::fabs(value) * 0.005f);
-
-        for (int dy = -1; dy <= 1; dy++)
-        {
-            for (int dx = -1; dx <= 1; dx++)
-            {
-                if (dx == 0 && dy == 0)
-                    continue;
-
-                int nx = x + dx;
-                int ny = y + dy;
-
-                if (nx < 0 || nx >= w || ny < 0 || ny >= h)
-                    continue;
-
-                float v = depth.at<float>(ny, nx);
-                if (!std::isfinite(v) || v <= 0.0f)
-                    continue;
-
-                valid_cnt++;
-
-                float diff = std::fabs(v - value);
-                diff_sum += diff;
-                max_diff = std::max(max_diff, diff);
-
-                if (diff <= tol)
-                    consistent_cnt++;
-            }
-        }
-
-        if (valid_cnt < 4)
-            return false;
-
-        float consistent_ratio = static_cast<float>(consistent_cnt) / valid_cnt;
-        float mean_diff = diff_sum / valid_cnt;
-
-        return (consistent_ratio >= 0.5f &&
-                mean_diff <= tol * 1.2f &&
-                max_diff <= tol * 3.0f);
+        std::cout << "Manual behavior model XML saved: " << xml_path << std::endl;
+        std::cout << "Manual behavior model params: "
+                  << "c0=" << behaviorModelParams[0] << ", "
+                  << "c1=" << behaviorModelParams[1] << ", "
+                  << "c2=" << behaviorModelParams[2] << std::endl;
+        std::cout << "DepthMin(max gt -> vd): " << depthMin << std::endl;
+        std::cout << "DepthMax(min gt -> vd): " << depthMax << std::endl;
     }
 
-    bool VirtualToRealDepthFunc::isStableGTPixel(
-            cv::Mat& gt,
-            int x,
-            int y,
-            float value,
-            float neighbor_tol_ratio)
+
+    void VirtualToRealDepthFunc::VirtualToRealDepthByManual(std::string& strFrameName)
     {
-        if (x < 0 || x >= gt.cols || y < 0 || y >= gt.rows)
-            return false;
+        m_strRootPath = m_ptrDepthSolver->GetRootPath();
 
-        if (!std::isfinite(value) || value <= 0.0f)
-            return false;
+        std::string strCommonPath = m_strRootPath + LF_DEPTH_INTRA_NAME + strFrameName + MVS_RESULT_DATA_FOLDER_NAME;
+        std::string virtualDepthImg_path =  strCommonPath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_NAME + ".tiff";
+        std::string virtualDepthColorImg_path = strCommonPath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_COLOR_NAME + ".png";
+        std::string refDepthImg_path = m_strRootPath + LF_BEHAIRMODEL_FOLDER_NAME + "ref-csad-rd.tiff";
+        std::string focuseImg_Path = strCommonPath + strFrameName + "_" + LF_FOUCSIMAGE_NAME + ".png";
+        std::string distanceImage_path = m_strRootPath + "/behavior_model/distanceImage.png";
 
-        std::vector<float> neighbors;
-        neighbors.reserve(9);
-        for (int dy = -1; dy <= 1; ++dy)
+        ManualUIState& state = GetManualUIState();
+        state = ManualUIState();
+
+        m_virtualDepthImage = cv::imread(virtualDepthImg_path, cv::IMREAD_UNCHANGED);
+        m_refDepthImage = cv::imread(refDepthImg_path, cv::IMREAD_UNCHANGED);
+        cv::Mat focusImage = cv::imread(focuseImg_Path, cv::IMREAD_COLOR);
+        cv::Mat virtualDepthColorImg = cv::imread(virtualDepthColorImg_path, cv::IMREAD_COLOR);
+
+        if (m_virtualDepthImage.empty() || m_refDepthImage.empty() ||
+            focusImage.empty() || virtualDepthColorImg.empty())
         {
-            for (int dx = -1; dx <= 1; ++dx)
-            {
-                int nx = x + dx;
-                int ny = y + dy;
-                if (nx < 0 || nx >= gt.cols || ny < 0 || ny >= gt.rows)
-                    continue;
+            std::cout << "manual mode input image is empty!" << std::endl;
+            return;
+        }
 
-                float v = gt.at<float>(ny, nx);
-                if (!std::isfinite(v) || v <= 0.0f)
-                    continue;
-                neighbors.push_back(v);
+        state.refDepth32F = ToSingleFloat(m_refDepthImage);
+        state.virtualDepth32F = ToSingleFloat(m_virtualDepthImage);
+
+        if (state.refDepth32F.empty() || state.virtualDepth32F.empty())
+        {
+            std::cout << "manual mode depth image preprocess failed!" << std::endl;
+            return;
+        }
+
+        if (focusImage.size() != state.refDepth32F.size() ||
+            virtualDepthColorImg.size() != state.refDepth32F.size())
+        {
+            std::cout << "manual mode image size mismatch!" << std::endl;
+            std::cout << "focusImage: " << focusImage.cols << "x" << focusImage.rows << std::endl;
+            std::cout << "virtualDepthColorImg: " << virtualDepthColorImg.cols << "x" << virtualDepthColorImg.rows << std::endl;
+            std::cout << "refDepthImage: " << state.refDepth32F.cols << "x" << state.refDepth32F.rows << std::endl;
+            return;
+        }
+
+        float highlightDepthMin = 16000.0f;
+        float highlightDepthMax = 20000.0f;
+
+        state.refFocusBase = BuildRefFocusImage(focusImage,state.refDepth32F,highlightDepthMin,highlightDepthMax);
+        state.virtualColorBase = virtualDepthColorImg.clone();
+        state.refFocusShow = state.refFocusBase.clone();
+        state.virtualColorShow = state.virtualColorBase.clone();
+        state.infoPanel = cv::Mat(950, 1400, CV_8UC3, cv::Scalar(255, 255, 255));
+
+        state.outputTxtPath = m_strRootPath + "/behavior_model/manual_vd_ref_pairs.txt";
+        state.outputScatterPath = m_strRootPath + "/behavior_model/manual_vd_ref_scatter.png";
+        state.outputFocusMarkedPath = m_strRootPath + "/behavior_model/manual_ref_focus_marked.png";
+        state.outputVirtualMarkedPath = m_strRootPath + "/behavior_model/manual_virtual_marked.png";
+
+        cv::namedWindow("FocusImage", cv::WINDOW_NORMAL);
+        cv::namedWindow("VirtualDepthColor", cv::WINDOW_NORMAL);
+        cv::namedWindow("InfoPanel", cv::WINDOW_NORMAL);
+
+        cv::moveWindow("FocusImage", 50, 50);
+        cv::moveWindow("VirtualDepthColor", 1050, 50);
+        cv::moveWindow("InfoPanel", 50, 850);
+
+        cv::setMouseCallback("FocusImage", OnMouseFocus, nullptr);
+        cv::setMouseCallback("VirtualDepthColor", OnMouseVirtual, nullptr);
+        cv::setMouseCallback("InfoPanel", OnMouseInfoPanel, nullptr);
+
+        RefreshManualWindows();
+
+        while (true)
+        {
+            int key = cv::waitKey(30);
+            if (key == 27) // ESC
+            {
+                break;
+            }
+            else if (key == 'z' || key == 'u' || key == 8)
+            {
+                UndoLastManualSelection();
             }
         }
 
-        if (neighbors.empty())
-            return false;
-        if (neighbors.size() == 1)
-            return true;
+        SaveManualPairsAndScatter();
 
-        std::sort(neighbors.begin(), neighbors.end());
-        float median = neighbors[neighbors.size() / 2];
+        // Step2: 用 manual 选出来并通过 RMSE 过滤后的均值点对参与拟合
+        FitManualBehaviorModelAndWriteXml(this);
 
-        float abs_tol = std::max(300.0f, std::fabs(median) * std::max(0.01f, neighbor_tol_ratio));
-        int inlier_cnt = 0;
-        for (size_t i = 0; i < neighbors.size(); ++i)
-        {
-            if (std::fabs(neighbors[i] - median) <= abs_tol)
-                inlier_cnt++;
-        }
+        cv::imwrite(state.outputFocusMarkedPath, state.refFocusShow);
+        cv::imwrite(state.outputVirtualMarkedPath, state.virtualColorShow);
 
-        return inlier_cnt >= std::max(1, static_cast<int>(neighbors.size() / 2));
+        std::cout << "manual pairs txt saved: " << state.outputTxtPath << std::endl;
+        std::cout << "manual scatter saved: " << state.outputScatterPath << std::endl;
+        std::cout << "manual ref focus marked image saved: " << state.outputFocusMarkedPath << std::endl;
+        std::cout << "manual virtual marked image saved: " << state.outputVirtualMarkedPath << std::endl;
+
+        cv::destroyWindow("FocusImage");
+        cv::destroyWindow("VirtualDepthColor");
+        cv::destroyWindow("InfoPanel");
+
+        SamplePointSelect();
+        m_realDepthImage = ConvertVdImageToRd(m_virtualDepthImage);
+        errorStatisticsImageGTSeg(m_realDepthImage, focusImage, distanceImage_path);
     }
 
-// 获取GT像素值
-    bool VirtualToRealDepthFunc::findStableGTValue(
-            cv::Mat& gt,
-            int vd_x,
-            int vd_y,
-            float& gt_value,
-            int& gt_x,
-            int& gt_y,
-            int max_radius)
+    bool LoadBehaviorModelSegmentsFromXml(const std::string& xmlPath,
+                                          std::vector<BehaviorModelSegment>& segments)
     {
-        struct Candidate
+        segments.clear();
+
+        cv::FileStorage fs(xmlPath, cv::FileStorage::READ);
+        if (!fs.isOpened())
+            return false;
+
+        cv::FileNode node = fs["BehaviorModelSegments"];
+        if (node.empty())
+            return false;
+
+        for (auto it = node.begin(); it != node.end(); ++it)
         {
-            int x;
-            int y;
-            float value;
-            float dist2;
-            float weight;
-        };
+            BehaviorModelSegment seg;
+            (*it)["DepthMin"] >> seg.depthMin;
+            (*it)["DepthMax"] >> seg.depthMax;
 
-        const float eps = 1e-6f;
-        const int min_valid_points = 2;      // 指定区域内最小有效GT点数
-        const float value_tol_ratio = 0.05f; // 相对中位数容差
-        const float min_abs_tol = 300.0f;    // GT单位为mm时的绝对容差
+            cv::FileNode param = (*it)["Param"];
+            param["c0"] >> seg.params[0];
+            param["c1"] >> seg.params[1];
+            param["c2"] >> seg.params[2];
 
-        std::vector<Candidate> candidates;
-        candidates.reserve((2 * max_radius + 1) * (2 * max_radius + 1));
+            segments.push_back(seg);
+        }
 
-        for (int dy = -max_radius; dy <= max_radius; ++dy)
+        return !segments.empty();
+    }
+
+    float ConvertVdToRdBySegments(float vDepth,
+                                  const std::vector<BehaviorModelSegment>& segments)
+    {
+        if (!(vDepth > 0.0f) || !std::isfinite(vDepth))
+            return 0.0f;
+
+        double z = 0.0;
+
+        for (size_t i = 0; i < segments.size(); ++i)
         {
-            for (int dx = -max_radius; dx <= max_radius; ++dx)
+            const BehaviorModelSegment& seg = segments[i];
+
+            if (vDepth >= seg.depthMin && vDepth < seg.depthMax)
             {
-                int nx = vd_x + dx;
-                int ny = vd_y + dy;
+                double c0 = seg.params[0];
+                double c1 = seg.params[1];
+                double c2 = seg.params[2];
 
-                if (nx < 0 || nx >= gt.cols || ny < 0 || ny >= gt.rows)
-                    continue;
+                double v = static_cast<double>(vDepth);
+                double denom = 1.0 - v * c0;
 
-                float v = gt.at<float>(ny, nx);
-                if (!isStableGTPixel(gt, nx, ny, v, 0.02f))
-                    continue;
+                if (std::fabs(denom) < 1.0e-12)
+                    return 0.0f;
 
-                float dist2 = static_cast<float>(dx * dx + dy * dy);
-                float weight = 1.0f / (dist2 + eps);
-                candidates.push_back((Candidate){nx, ny, v, dist2, weight});
+                z = (v * c1 + c2) / denom;
+                break;
             }
         }
 
-        if ((int)candidates.size() < min_valid_points)
-            return false;
+        if (!std::isfinite(z) || z < 0.0)
+            return 0.0f;
 
-        std::vector<float> values;
-        values.reserve(candidates.size());
-        for (size_t i = 0; i < candidates.size(); ++i)
-            values.push_back(candidates[i].value);
+        return static_cast<float>(z);
+    }
 
-        std::sort(values.begin(), values.end());
-        float median = values[values.size() / 2];
+    float ComputeMeanInRectValidOnly(const cv::Mat& depth32F,
+                                     const cv::Rect& rect,
+                                     int& validCount)
+    {
+        validCount = 0;
 
-        float tol = std::max(min_abs_tol, std::fabs(median) * value_tol_ratio);
+        if (depth32F.empty())
+            return 0.0f;
 
-        double weighted_sum = 0.0;
-        double weight_sum = 0.0;
-        int inlier_count = 0;
+        cv::Rect imgRect(0, 0, depth32F.cols, depth32F.rows);
+        cv::Rect roi = rect & imgRect;
+        if (roi.width <= 0 || roi.height <= 0)
+            return 0.0f;
 
-        for (size_t i = 0; i < candidates.size(); ++i)
+        double sum = 0.0;
+        for (int y = roi.y; y < roi.y + roi.height; ++y)
         {
-            if (std::fabs(candidates[i].value - median) > tol)
-                continue;
-
-            weighted_sum += static_cast<double>(candidates[i].value) * candidates[i].weight;
-            weight_sum += candidates[i].weight;
-            inlier_count++;
-        }
-
-        if (inlier_count < min_valid_points || weight_sum <= eps)
-            return false;
-
-        gt_value = static_cast<float>(weighted_sum / weight_sum);
-
-        bool found_nearest = false;
-        float best_dist2 = std::numeric_limits<float>::max();
-        for (size_t i = 0; i < candidates.size(); ++i)
-        {
-            if (std::fabs(candidates[i].value - median) > tol)
-                continue;
-
-            if (candidates[i].dist2 < best_dist2)
+            for (int x = roi.x; x < roi.x + roi.width; ++x)
             {
-                best_dist2 = candidates[i].dist2;
-                gt_x = candidates[i].x;
-                gt_y = candidates[i].y;
-                found_nearest = true;
+                float v = ReadDepthValue(depth32F, x, y);
+                if (v > 0.0f)
+                {
+                    sum += v;
+                    validCount++;
+                }
             }
         }
 
-        return found_nearest;
-    }*/
+        if (validCount == 0)
+            return 0.0f;
 
+        return static_cast<float>(sum / static_cast<double>(validCount));
+    }
+
+    cv::Rect BuildBoundingRectFromPoints(const std::vector<cv::Point>& pts)
+    {
+        if (pts.empty())
+            return cv::Rect();
+
+        return cv::boundingRect(pts);
+    }
+
+    void RefreshValidationWindow()
+    {
+        ValidationUIState& state = GetValidationUIState();
+
+        state.focusShow = state.focusBase.clone();
+
+        // 先画历史记录
+        for (size_t i = 0; i < state.records.size(); ++i)
+        {
+            const ValidationBoxRecord& rec = state.records[i];
+
+            // 画四边形
+            for (int k = 0; k < 4; ++k)
+            {
+                cv::line(state.focusShow,
+                         rec.corners[k],
+                         rec.corners[(k + 1) % 4],
+                         cv::Scalar(0, 255, 255), 2);
+            }
+
+            // 画包围盒
+            cv::rectangle(state.focusShow, rec.bbox, cv::Scalar(0, 255, 0), 2);
+
+            // 角点
+            for (size_t k = 0; k < rec.corners.size(); ++k)
+            {
+                cv::circle(state.focusShow, rec.corners[k], 2, cv::Scalar(0, 0, 255), -1);
+            }
+
+            std::string line1 =
+                    "vd_M=" + std::to_string(rec.vdMean) +
+                    "  rd=" + std::to_string(rec.rdEst);
+
+            std::string line2;
+            if (rec.hasRefMean)
+            {
+                line2 =
+                        "ref_M=" + std::to_string(rec.refMean) +
+                        "  absErr=" + std::to_string(rec.absErr);
+            }
+
+            int textX = std::max(30, rec.bbox.x);
+            int textY = std::max(250, rec.bbox.y - 25);
+
+            cv::putText(state.focusShow, line1, cv::Point(textX, textY),
+                        cv::FONT_HERSHEY_SIMPLEX, 2, cv::Scalar(0, 255, 0), 2);
+
+            if (!line2.empty())
+            {
+                cv::putText(state.focusShow, line2, cv::Point(textX, textY - 28),
+                            cv::FONT_HERSHEY_SIMPLEX, 2, cv::Scalar(255, 0, 255), 2);
+            }
+
+            std::string idx = "#" + std::to_string(static_cast<int>(i + 1));
+            cv::putText(state.focusShow, idx, rec.bbox.tl() + cv::Point(4, 20),
+                        cv::FONT_HERSHEY_SIMPLEX, 2, cv::Scalar(255, 0, 0), 2);
+        }
+
+        // 再画当前正在点的点和临时线
+        for (size_t i = 0; i < state.currentPoints.size(); ++i)
+        {
+            cv::circle(state.focusShow, state.currentPoints[i], 5, cv::Scalar(0, 0, 255), -1);
+
+            std::string idx = std::to_string(static_cast<int>(i + 1));
+            cv::putText(state.focusShow, idx, state.currentPoints[i] + cv::Point(5, -5),
+                        cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 2);
+
+            if (i > 0)
+            {
+                cv::line(state.focusShow, state.currentPoints[i - 1], state.currentPoints[i],
+                         cv::Scalar(255, 255, 0), 2);
+            }
+        }
+
+        std::string tip =
+                "Validate Mode: Left click 4 points | Z/U/Backspace undo | C clear | ESC save&quit";
+        cv::putText(state.focusShow, tip, cv::Point(20, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 4, cv::Scalar(20, 20, 20), 2);
+
+        cv::imshow("FocusImage_Validate", state.focusShow);
+    }
+
+    void CommitValidationBoxFromCurrentPoints()
+    {
+        ValidationUIState& state = GetValidationUIState();
+
+        if (state.currentPoints.size() != 4)
+            return;
+
+        ValidationBoxRecord rec;
+        rec.corners = state.currentPoints;
+        rec.bbox = BuildBoundingRectFromPoints(rec.corners);
+
+        rec.vdMean = ComputeMeanInRectValidOnly(state.vd32F, rec.bbox, rec.vdValidCount);
+        rec.rdEst = ConvertVdToRdBySegments(rec.vdMean, state.segments);
+
+        if (!state.ref32F.empty())
+        {
+            rec.refMean = ComputeMeanInRectValidOnly(state.ref32F, rec.bbox, rec.refValidCount);
+            if (rec.refValidCount > 0)
+            {
+                rec.hasRefMean = true;
+                rec.absErr = std::fabs(rec.refMean - rec.rdEst);
+            }
+        }
+
+        state.records.push_back(rec);
+        state.currentPoints.clear();
+
+        RefreshValidationWindow();
+    }
+
+    void UndoValidationLastStep()
+    {
+        ValidationUIState& state = GetValidationUIState();
+
+        if (!state.currentPoints.empty())
+        {
+            state.currentPoints.pop_back();
+        }
+        else if (!state.records.empty())
+        {
+            state.records.pop_back();
+        }
+
+        RefreshValidationWindow();
+    }
+
+    void OnMouseValidateFocus(int event, int x, int y, int flags, void* userdata)
+    {
+        (void)flags;
+        (void)userdata;
+
+        ValidationUIState& state = GetValidationUIState();
+
+        if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            if (x < 0 || y < 0 || x >= state.focusBase.cols || y >= state.focusBase.rows)
+                return;
+
+            if (state.currentPoints.size() < 4)
+            {
+                state.currentPoints.emplace_back(x, y);
+                RefreshValidationWindow();
+
+                if (state.currentPoints.size() == 4)
+                {
+                    CommitValidationBoxFromCurrentPoints();
+                }
+            }
+        }
+        else if (event == cv::EVENT_RBUTTONDOWN)
+        {
+            UndoValidationLastStep();
+        }
+    }
+
+    void SaveValidationResults()
+    {
+        ValidationUIState& state = GetValidationUIState();
+
+        cv::imwrite(state.outputImagePath, state.focusShow);
+
+        std::ofstream ofs(state.outputTxtPath.c_str());
+        if (!ofs.is_open())
+            return;
+
+        ofs << "# idx x0 y0 x1 y1 x2 y2 x3 y3 "
+               "bbox_x bbox_y bbox_w bbox_h "
+               "vd_mean rd_est ref_mean abs_err vd_valid_count ref_valid_count\n";
+
+        for (size_t i = 0; i < state.records.size(); ++i)
+        {
+            const ValidationBoxRecord& rec = state.records[i];
+
+            ofs << (i + 1) << " ";
+
+            for (int k = 0; k < 4; ++k)
+            {
+                ofs << rec.corners[k].x << " " << rec.corners[k].y << " ";
+            }
+
+            ofs << rec.bbox.x << " "
+                << rec.bbox.y << " "
+                << rec.bbox.width << " "
+                << rec.bbox.height << " "
+                << rec.vdMean << " "
+                << rec.rdEst << " ";
+
+            if (rec.hasRefMean)
+                ofs << rec.refMean << " " << rec.absErr << " ";
+            else
+                ofs << 0.0f << " " << 0.0f << " ";
+
+            ofs << rec.vdValidCount << " "
+                << rec.refValidCount << "\n";
+        }
+
+        ofs.close();
+    }
+
+    void VirtualToRealDepthFunc::ValidateBehaviorModelByBox()
+    {
+        m_strRootPath = m_ptrDepthSolver->GetRootPath();
+
+        std::string virtualDepthImg_path = m_strRootPath + "/behavior_model/VD_Raw.tiff";
+        std::string refDepthImg_path = m_strRootPath + "/behavior_model/ref-csad-rd.tiff";
+        std::string focuseImg_Path = m_strRootPath + "/behavior_model/fullfocus.png";
+
+        ValidationUIState& state = GetValidationUIState();
+        state = ValidationUIState();
+
+        cv::Mat vdRaw = cv::imread(virtualDepthImg_path, cv::IMREAD_UNCHANGED);
+        cv::Mat refRaw = cv::imread(refDepthImg_path, cv::IMREAD_UNCHANGED);
+        cv::Mat focusImage = cv::imread(focuseImg_Path, cv::IMREAD_COLOR);
+
+        if (vdRaw.empty() || focusImage.empty())
+        {
+            std::cout << "ValidateBehaviorModelByBox: input image is empty!" << std::endl;
+            return;
+        }
+
+        state.vd32F = ToSingleFloat(vdRaw);
+        state.ref32F = ToSingleFloat(refRaw);
+
+        if (state.vd32F.empty())
+        {
+            std::cout << "ValidateBehaviorModelByBox: vd image preprocess failed!" << std::endl;
+            return;
+        }
+
+        if (focusImage.size() != state.vd32F.size())
+        {
+            std::cout << "ValidateBehaviorModelByBox: image size mismatch!" << std::endl;
+            return;
+        }
+
+        // 读取分段行为模型
+        boost::filesystem::path root_path(m_strRootPath);
+        boost::filesystem::path root_path_parent = root_path.parent_path();
+        std::string strCalibPath = root_path_parent.string() + LF_CALIB_FOLDER_NAME;
+        std::string xmlPath = strCalibPath + "behaviorModelParamsSegment.xml";
+
+        if (!LoadBehaviorModelSegmentsFromXml(xmlPath, state.segments))
+        {
+            std::cout << "ValidateBehaviorModelByBox: failed to load behavior model xml: "
+                      << xmlPath << std::endl;
+            return;
+        }
+
+        state.focusBase = focusImage.clone();
+        state.focusShow = state.focusBase.clone();
+
+        state.outputImagePath = m_strRootPath + "/behavior_model/validate_box_result.png";
+        state.outputTxtPath = m_strRootPath + "/behavior_model/validate_box_result.txt";
+
+        cv::namedWindow("FocusImage_Validate", cv::WINDOW_NORMAL);
+        cv::moveWindow("FocusImage_Validate", 100, 100);
+        cv::setMouseCallback("FocusImage_Validate", OnMouseValidateFocus, nullptr);
+
+        RefreshValidationWindow();
+
+        while (true)
+        {
+            int key = cv::waitKey(30);
+
+            if (key == 27) // ESC
+            {
+                break;
+            }
+            else if (key == 'z' || key == 'u' || key == 8)
+            {
+                UndoValidationLastStep();
+            }
+            else if (key == 'c')
+            {
+                state.currentPoints.clear();
+                state.records.clear();
+                RefreshValidationWindow();
+            }
+        }
+
+        SaveValidationResults();
+
+        std::cout << "validate image saved: " << state.outputImagePath << std::endl;
+        std::cout << "validate txt saved: " << state.outputTxtPath << std::endl;
+
+        cv::destroyWindow("FocusImage_Validate");
+    }
 }
