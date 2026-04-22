@@ -37,7 +37,7 @@ namespace LFMVS
     #define LF_DEPTH_INTER_NAME ("/depth_inter/")
     #define LF_UNDISTOR_NAME ("/Undistorion/")
     #define LF_RAW_MLA_IMAGES_NAME ("/MLA_images/")
-    #define LF_MVS_RESULT_DATA_NAME ("/MVSResult/")
+    #define MVS_RESULT_DATA_FOLDER_NAME ("/MVSResult/")
     #define LF_CAMERA_PLOTTER_NAME ("/CameraPlotter/")
     #define MLA_WHITE_CENTERS_INFO_NAME ("CalibInfo.xml") // 利用白图像自动计算的微透镜图像中心点坐标
     #define MLA_WHITE_CENTERS_CIRCLE_INFO_NAME ("CalibInfo_circle.png") // 利用白图像自动计算的微透镜图像中心点坐标
@@ -49,13 +49,16 @@ namespace LFMVS
     #define LF_MLA_DISPARITYMAPS_NAME ("/MLA_DMaps/") // 微透镜图像的深度图
     #define LF_MLA_DISPARITYMAPS_PLANNER_NAME ("/MLA_DMaps_Planner/") // 微透镜图像的平面先验深度图
 
+    #define LF_BEHAIRMODEL_FOLDER_NAME ("/behavior_model/") // 行为模型文件夹名称
 
-    #define LF_DISPARITYHMAP_NAME ("Disparity") // 虚拟深度图名称
-    #define LF_VIRTUALDEPTHMAP_NAME ("VitualDepthMap") // 虚拟深度图名称
+    #define LF_DISPARITYHMAP_NAME ("Disparity") // 视差图名称
+    #define LF_VIRTUALDEPTHMAP_NAME ("VD_raw") // 虚拟深度图的原始深度值
+    #define LF_VIRTUALDEPTHMAP_COLOR_NAME ("VD_color") // 虚拟深度图的彩色
+    #define LF_VIRTUALDEPTHMAP_GRAY_NAME ("VD_gray") // 虚拟深度图的彩色
     #define LF_VIRTUALDEPTH_CONFMAP_RAW_NAME ("Depth_ConfMap_Raw") // 虚拟深度空间中深度置信图名称
     #define LF_VIRTUALDEPTH_CONFMAP_NAME ("Depth_ConfMap") // 二值化：虚拟深度空间中深度置信图名称
     #define LF_ALLINFOUCSIMAGE_NAME ("/AIF_Color") // 全聚焦图像名称
-    #define LF_FOUCSIMAGE_NAME ("fullfocus") // 全聚焦图像名称
+    #define LF_FOUCSIMAGE_NAME ("FullFocus") // 全聚焦图像名称
 
     ////////////////////////////////////////////////////////////////
     // brief: 基础类型别名
