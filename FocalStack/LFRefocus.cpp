@@ -34,6 +34,141 @@ namespace std
 
 namespace LFMVS
 {
+        static cv::Mat ConvertVDColorToDepthGray_ByColorLUT(
+    const cv::Mat& VD_Color_Output,
+    const cv::Mat& validMaskVis,
+    bool farBright = true)
+{
+    CV_Assert(VD_Color_Output.type() == CV_8UC3);
+
+    const int rows = VD_Color_Output.rows;
+    const int cols = VD_Color_Output.cols;
+
+    cv::Mat VD_DepthGray(rows, cols, CV_8UC1, cv::Scalar(0));
+
+    // 转 HSV，H 表示颜色类型，S 表示颜色纯度，V 表示亮度
+    cv::Mat hsv;
+    cv::cvtColor(VD_Color_Output, hsv, cv::COLOR_BGR2HSV);
+
+    for (int y = 0; y < rows; ++y)
+    {
+        const cv::Vec3b* bgrPtr = VD_Color_Output.ptr<cv::Vec3b>(y);
+        const cv::Vec3b* hsvPtr = hsv.ptr<cv::Vec3b>(y);
+        const uchar* maskPtr = validMaskVis.empty() ? nullptr : validMaskVis.ptr<uchar>(y);
+        uchar* grayPtr = VD_DepthGray.ptr<uchar>(y);
+
+        for (int x = 0; x < cols; ++x)
+        {
+            if (maskPtr && maskPtr[x] == 0)
+            {
+                grayPtr[x] = 0;
+                continue;
+            }
+
+            cv::Vec3b bgr = bgrPtr[x];
+
+            // 背景是中性深灰，例如 BGR=(60,60,60)
+            // 注意 OpenCV 读写是 BGR 顺序
+            int db = std::abs((int)bgr[0] - 60);
+            int dg = std::abs((int)bgr[1] - 60);
+            int dr = std::abs((int)bgr[2] - 60);
+
+            if (db < 8 && dg < 8 && dr < 8)
+            {
+                grayPtr[x] = 0;
+                continue;
+            }
+
+            uchar H = hsvPtr[x][0];  // 0~179
+            uchar S = hsvPtr[x][1];  // 0~255
+            uchar V = hsvPtr[x][2];  // 0~255
+
+            // 饱和度太低，说明接近灰色，认为无效
+            if (S < 40 || V < 30)
+            {
+                grayPtr[x] = 0;
+                continue;
+            }
+
+            float depthNorm = 0.0f;
+
+            // 这里按照你的图像含义建立颜色到距离的映射：
+            // 绿色近，黄色/橙色中等，红色远。
+            //
+            // OpenCV HSV 大致范围：
+            // 红色：H=0 附近
+            // 橙色：H=10~25
+            // 黄色：H=25~35
+            // 绿色：H=45~85
+            // 青色：H=85~100
+            // 蓝色：H=100~130
+            // 紫色：H=130~160
+
+            if (H >= 45 && H <= 85)
+            {
+                // 绿色：近距离
+                // H 越靠近黄色，距离略增大
+                float t = (85.0f - H) / 40.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+
+                depthNorm = 0.10f + 0.20f * t;
+            }
+            else if (H >= 25 && H < 45)
+            {
+                // 黄色 / 黄绿色：近中距离
+                float t = (45.0f - H) / 20.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+
+                depthNorm = 0.30f + 0.25f * t;
+            }
+            else if (H >= 10 && H < 25)
+            {
+                // 橙色：中远距离
+                float t = (25.0f - H) / 15.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+
+                depthNorm = 0.55f + 0.25f * t;
+            }
+            else if ((H >= 0 && H < 10) || (H >= 170 && H <= 179))
+            {
+                // 红色：远距离
+                depthNorm = 0.85f;
+            }
+            else if (H >= 85 && H < 105)
+            {
+                // 青色：通常比绿色更近，或者作为近距离过渡
+                depthNorm = 0.05f;
+            }
+            else if (H >= 105 && H < 135)
+            {
+                // 蓝色：按近距离或异常值处理
+                depthNorm = 0.03f;
+            }
+            else if (H >= 135 && H < 170)
+            {
+                // 紫色：你图中大量出现在背景散点区域，
+                // 更像噪声或极端值。这里先压到很低灰度。
+                depthNorm = 0.02f;
+            }
+            else
+            {
+                depthNorm = 0.0f;
+            }
+
+            depthNorm = std::max(0.0f, std::min(1.0f, depthNorm));
+
+            // MVS 深度图一般可理解为：灰度值越大，距离越远。
+            // 如果你想近处更亮，把 farBright 设为 false。
+            if (!farBright)
+                depthNorm = 1.0f - depthNorm;
+
+            grayPtr[x] = cv::saturate_cast<uchar>(depthNorm * 255.0f);
+        }
+    }
+
+    return VD_DepthGray;
+}
+
     LFRefocus::LFRefocus(DepthSolver* pDepthSolver)
         : m_ptrDepthSolver(pDepthSolver)
     {
@@ -1774,7 +1909,6 @@ void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& it
         }
 
         cv::Mat VD_Gray = cv::Mat::zeros(image_height, image_width, CV_8UC1);
-
         // 这里别再太强提亮了，否则会继续发白
         const float gamma = 0.90f;
         const bool reverseColor = true;
@@ -1803,9 +1937,8 @@ void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& it
                 grayPtr[col] = cv::saturate_cast<uchar>(t * 255.0f);
             }
         }
-
-        std::string strVDGrayPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_GRAY_NAME + std::string(".png");
-        cv::imwrite(strVDGrayPath, VD_Gray);
+        // std::string strVDGrayPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_GRAY_NAME + std::string(".png");
+        // cv::imwrite(strVDGrayPath, VD_Gray);
         // 仅用于显示：让稀疏深度稍微“长粗”一点，更容易看
         cv::Mat VD_Gray_Vis = VD_Gray.clone();
         cv::Mat validMaskVis = validMask.clone();
@@ -1815,7 +1948,6 @@ void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& it
 
         cv::Mat VD_Color;
         cv::applyColorMap(VD_Gray_Vis, VD_Color, cv::COLORMAP_TURBO);
-
         // 增强颜色：重点提饱和度，亮度只轻微加一点
         cv::Mat hsv;
         cv::cvtColor(VD_Color, hsv, cv::COLOR_BGR2HSV);
@@ -1851,6 +1983,22 @@ void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& it
         // 不再对整张图做 GaussianBlur，否则又会被洗淡
         std::string strVDColorPath = m_strSavePath + strFrameName + "_" + LF_VIRTUALDEPTHMAP_COLOR_NAME+ std::string(".png");
         cv::imwrite(strVDColorPath, VD_Color_Output);
+
+        {
+            // =======================================================
+            // 根据 VD_Color_Output 的颜色值反推深度灰度图
+            // 约定：红色远，绿色近，灰色背景无效
+            // farBright = true 表示距离越远灰度值越大
+            // =======================================================
+            cv::Mat VD_DepthGray_FromColor =
+                ConvertVDColorToDepthGray_ByColorLUT(VD_Color_Output, validMaskVis, true);
+
+            // 保存根据颜色反推的深度灰度图
+            std::string strVDDepthGrayFromColorPath =
+                m_strSavePath + strFrameName + "_VD_DepthGray_FromColor.png";
+
+            cv::imwrite(strVDDepthGrayFromColorPath, VD_DepthGray_FromColor);
+        }
 
         LOG_ERROR("LF-Refocus-backproject vis range: lo=", lo_vis,
                   " hi=", hi_vis,
@@ -1928,10 +2076,10 @@ void LFRefocus::FuseVirtualDepth_BackProject(QuadTreeProblemMapMap::iterator& it
         print_result(R, cfg);
     }
 
-    std::vector<PointList> PointCloud_Object;
-    Virtual2ObjectDepth(PointCloud_Object, PointCloud);
-    std::string object_ply_path = m_strSavePath + "/object_3dmodel.ply";
-    StoreColorPlyFileBinaryPointCloud(object_ply_path, PointCloud_Object);
+    // std::vector<PointList> PointCloud_Object;
+    // Virtual2ObjectDepth(PointCloud_Object, PointCloud);
+    // std::string object_ply_path = m_strSavePath + "/object_3dmodel.ply";
+    // StoreColorPlyFileBinaryPointCloud(object_ply_path, PointCloud_Object);
 
     LOG_ERROR("LFRefocus: FuseVirtualDepth_BackProject, End");
 }
